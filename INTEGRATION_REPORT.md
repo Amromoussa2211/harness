@@ -1,5 +1,5 @@
 ================================================================================
-HERMES QA AGENT HARNESS — TARGET PROJECT INTEGRATION ARCHITECTURE
+# QA AGENT HARNESS — TARGET PROJECT INTEGRATION ARCHITECTURE
 Consolidated Report — Phase: Integration Contract & Discovery Validation
 Date: 2026-09-20
 ================================================================================
@@ -12,7 +12,7 @@ The QA Agent Harness is an INDEPENDENT control plane — it is NOT copied into
 application repositories.
 
 +----------------------------------------------------------+
-|  HERMES QA AGENT HARNESS (this repository)              |
+|  QA AGENT HARNESS (this repository)              |
 |  - Orchestration (qa-run, 14 stages)                    |
 |  - Analysis, skill selection, reporting                 |
 |  - Project adapter (adapters/project_adapter.py)        |

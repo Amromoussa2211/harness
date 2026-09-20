@@ -1,5 +1,5 @@
 # QA Agent Harness — Target Project Integration
-# Copyright (c) 2026 Hermes QA Agent Harness
+# Copyright (c) 2026 QA Agent Harness
 # MIT License — see LICENSE file for details.
 
 """

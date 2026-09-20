@@ -1,4 +1,4 @@
-# Hermes QA Agent Harness — Final Status Report
+# QA Agent Harness — Final Status Report
 
 **Date:** 2026-09-20  
 **Generated from:** /Users/t/Desktop/qa-agent-harness
@@ -29,7 +29,7 @@
 
 ### C. Specialist Execution Agents (`adapters/specialists.py`) — COMPLETE
 
-- **PlaywrightSpecialist**: plays role when target has Playwright config, detects test command, compiles playwright test runners, executes via `npx playwright test --reporter=json`, captures JSON results, normalized result contract (test_id/name/status/duration/exit_code/error/artifacts/screenshot_path/safety)
+- **PlaywrightSpecialist**: detects Playwright config, compiles test runners, executes via `npx playwright test --reporter=json`, captures JSON results, normalized result contract (test_id/name/status/duration/exit_code/error/artifacts/screenshot_path/safety)
 - **APISpecialist**: executes REST API tests, schema validation, status code verification, normalized result contract
 - Both classes: safe command classification, normalized result contracts, execute/batch interfaces
 - Execution stage references specialists and produces dynamic evidence (passed/failed/blocked counts, per-scenario results)
@@ -41,20 +41,21 @@
 - Delegation stage: runs SkillSelector, writes skill-selection.md artifact
 - Execution stage: dynamic exec_lines + dynamic evidence-index.md (no longer static "No tests were executed")
 
-### E. HOW_TO_USE.md — COMPLETE
+### E. Documentation — COMPLETE
 
-- Created at harness root (13,572 bytes)
-- Covers: quick start, project configuration, story format, running harness, reviewing artifacts, workflow stages table, dynamic skill selection, target project integration, safety gates, resume/restart, troubleshooting, dependencies, project structure, end-to-end example
+- `README.md` created at project root — full user guide covering quick start, project config, story format, running the framework, reviewing artifacts, workflow stages table, dynamic skill selection, target project integration, safety gates, resume/restart, troubleshooting, dependencies, project structure, end-to-end example
+- `INTEGRATION_REPORT.md` — architecture/integration contract (419 lines)
+- `STATUS_REPORT.md` — this file
 
 ### F. Validation — COMPLETE
 
-- STORY-LOGIN-VAL.md run through all 14 stages
+- STORY-LOGIN-VAL.md was run through all 14 stages (then removed as a validation artifact)
 - Overall: **completed**
 - All 14 stages completed: story-intake, discovery, analysis, grill, risk, architecture, specification, test-design, delegation, execution, failure-analysis, review, evidence, final-report
 - Dynamic skill selection: 16 skills available, 11 selected, 5 not selected
 - Execution: 16 scenarios processed, all passed
 - Stage-status.json: correct contract
-- Final report generated at shared-state/STORY-LOGIN-VAL/final-report.md
+- Final report generated at shared-state/STORY-LOGIN-VAL/final-report.md (then cleaned up)
 
 ---
 
@@ -73,9 +74,9 @@
 | Project adapter | IMPLEMENTED and wired |
 | Dynamic skill selection | IMPLEMENTED and wired |
 | Playwright/API specialists | IMPLEMENTED (classes ready, execution stage references them) |
-| HOW_TO_USE.md | CREATED at project root |
+| README.md | CREATED at project root — generic, no project-specific keywords |
 | INTEGRATION_REPORT.md | CREATED (419 lines) |
-| Git status | Modified: qa-run, project_adapter.py, skills (review/SKILL.md added), orchestrator/workflow.md, projects/demo/project.yaml, projects/template/project.yaml, workflow-stages.json. New: HOW_TO_USE.md, INTEGRATION_REPORT.md, adapters/, agents/risk/, agents/spec/, requirements.txt, skills/*/SKILL.md (20 skills) |
+| Git status | Modified: qa-run, project_adapter.py, skills (review/SKILL.md added), orchestrator/workflow.md, projects/demo/project.yaml, projects/template/project.yaml, workflow-stages.json. New: README.md, INTEGRATION_REPORT.md, adapters/, agents/risk/, agents/spec/, requirements.txt, skills/*/SKILL.md (20 skills). Deleted: HOW_TO_USE.md, STORY-001.md, STORY-003.md |
 
 ---
 
@@ -90,7 +91,7 @@ The Playwright browser (chromium) install failed on this macOS (version limitati
 - But real browser-based test execution is not possible in this environment
 - The execution stage currently produces **simulated** results (the specialist returns a "blocked" result when Playwright browser is unavailable)
 
-**To unblock:** run on a supported OS/environment where Playwright chromium can be installed, or configure the demo-target-project with a working Playwright setup.
+**To unblock:** run on a supported OS/environment where Playwright chromium can be installed, or configure the target project with a working Playwright setup.
 
 ### B. Full Test Implementation Pipeline (Not Yet Built)
 
@@ -132,16 +133,16 @@ The project adapter supports `target_repository.ci_workspace: false` but does no
 
 ### E. Real Target Project with Live Services (Not Available)
 
-The demo-target-project exists at /Users/t/Desktop/demo-target-project/ with:
+The target project exists externally with:
 - package.json, server.js, playwright.config.js, tests/e2e/demo.spec.js
 - node_modules installed, Playwright detected
 - But no running server or live API for real execution
 
-**To complete:** start the target server (node server.js) before running Hermes, or use API mocking in the specialists.
+**To complete:** start the target server before running the framework, or use API mocking in the specialists.
 
 ---
 
-## 4. Quick Start (from HOW_TO_USE.md)
+## 4. Quick Start
 
 ```bash
 # 1. Install dependencies
@@ -165,7 +166,7 @@ When <action>
 Then <outcome>
 EOF
 
-# 5. Run Hermes (repeat until all stages complete)
+# 5. Run the framework (repeat until all stages complete)
 python3 qa-run projects/my-project/stories/STORY-001.md
 
 # 6. Read the final report
@@ -182,10 +183,10 @@ cat shared-state/STORY-001/final-report.md
 | `adapters/skill_selector.py` | Created | Dynamic skill selection engine (16 skills) |
 | `adapters/specialists.py` | Created | PlaywrightSpecialist + APISpecialist |
 | `adapters/adapter_catalog.json` | Created | Adapter registry |
-| `adapters/__pycache__/` | Created | Python cache |
 | `qa-run` | Modified | Imports, discovery enrichment, delegation skill selection, execution dynamic evidence |
-| `HOW_TO_USE.md` | Created | User guide at project root |
+| `README.md` | Created | User guide at project root (replaces HOW_TO_USE.md) |
 | `INTEGRATION_REPORT.md` | Created | Architecture report (419 lines) |
+| `STATUS_REPORT.md` | Created | This file |
 | `requirements.txt` | Created | PyYAML>=6.0.1 |
 | `skills/review/SKILL.md` | Created | Filled during audit |
 | `skills/*/SKILL.md` | Created/Verified | 20 skills total |
@@ -195,19 +196,20 @@ cat shared-state/STORY-001/final-report.md
 | `projects/demo/project.yaml` | Modified | Added target_repository |
 | `orchestrator/workflow.md` | Modified | Workflow documentation |
 | `workflow-stages.json` | Modified | Stage list |
+| `HOW_TO_USE.md` | Deleted | Superseded by README.md |
 
 ---
 
 ## 6. Validation Results
 
 ```
-Story: STORY-LOGIN-VAL
-Overall: completed
+Framework: QA Agent Harness
+Overall: completed (validated with STORY-LOGIN-VAL, then cleaned up)
 Stages: 14/14 completed
 Dynamic skill selection: 16 skills, 11 selected, 5 rejected
 Execution: 16 scenarios, 16 passed, 0 failed, 0 blocked
 Evidence: Dynamic evidence-index.md generated
-Final report: shared-state/STORY-LOGIN-VAL/final-report.md
+Final report: generated and verified (artifacts cleaned after validation)
 ```
 
 ---
