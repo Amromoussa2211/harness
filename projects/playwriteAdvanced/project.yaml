@@ -1,0 +1,35 @@
+project:
+  name: playwriteAdvanced
+  description: Playwright advanced automation framework with web, mobile, performance, and security tests
+
+application:
+  web: true
+  api: false
+  mobile: true
+
+automation:
+  framework: playwright
+  language: javascript
+
+api:
+  rest: false
+  graphql: false
+  webhooks: true
+
+database:
+  enabled: false
+  type: none
+
+target_repository:
+  path: ../playwriteAdvanced
+  ci_workspace: false
+
+environments:
+  dev: true
+  staging: false
+  production: false
+
+safety:
+  production_execution: false
+  real_payments: false
+  destructive_database_operations: false

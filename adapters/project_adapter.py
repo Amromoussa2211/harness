@@ -35,6 +35,36 @@ from typing import Any
 
 NOW = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 SIX_STATUSES = {"pending", "in_progress", "completed", "blocked", "failed", "skipped"}
+# Directories to skip during file scanning (dependency caches, build artifacts)
+SKIP_DIRS = frozenset({
+    "node_modules", ".git", ".hg", ".svn", "vendor", "venv", ".venv",
+    "__pycache__", ".pytest_cache", ".mypy_cache", "dist", "build",
+    ".next", "coverage", ".coverage", "target", ".idea", ".vscode",
+    "playwright-report", "test-results", "allure-results",
+})
+
+
+def _should_skip(path):
+    """Return True if the path is inside a directory that should be skipped."""
+    for part in path.parts:
+        if part in SKIP_DIRS:
+            return True
+    return False
+
+
+def _scan_files(repo):
+    """Yield files in repo, skipping dependency/cache directories."""
+    for f in repo.rglob("*"):
+        if f.is_file() and not _should_skip(f):
+            yield f
+
+
+def _scan_dirs(repo):
+    """Yield immediate subdirectories, skipping dependency/cache directories."""
+    for d in repo.iterdir():
+        if d.is_dir() and d.name not in SKIP_DIRS:
+            yield d
+
 
 
 # ── Project Adapter ──────────────────────────────────────────────────────────
@@ -177,7 +207,7 @@ class ProjectAdapter:
 
         # Check for GraphQL
         gql_indicators = ["graphql", ".gql", "graphql-tag", "@graphql"]
-        for f in repo.rglob("*"):
+        for f in _scan_files(repo):
             if f.is_file():
                 try:
                     content = f.read_text()
@@ -204,7 +234,7 @@ class ProjectAdapter:
 
         # ── Webhooks ──
         webhook_indicators = ["webhook", "webhooks", "callback", "callbacks"]
-        for f in repo.rglob("*"):
+        for f in _scan_files(repo):
             if f.is_file() and f.suffix in {".js", ".ts", ".py", ".java", ".json", ".yaml", ".yml", ".md"}:
                 try:
                     content = f.read_text().lower()
@@ -296,7 +326,7 @@ class ProjectAdapter:
 
         # Selenium
         selenium_indicators = ["selenium-webdriver", "selenium.java", "WebDriver"]
-        for f in repo.rglob("*"):
+        for f in _scan_files(repo):
             if f.is_file() and f.suffix in {".js", ".ts", ".py", ".java"}:
                 try:
                     content = f.read_text()
@@ -309,7 +339,7 @@ class ProjectAdapter:
 
         # Appium
         appium_indicators = ["appium", "Appium", "wd.io", "webdriverio"]
-        for f in repo.rglob("*"):
+        for f in _scan_files(repo):
             if f.is_file() and f.suffix in {".js", ".ts", ".py"}:
                 try:
                     content = f.read_text()
@@ -343,7 +373,7 @@ class ProjectAdapter:
 
         # Java test frameworks
         java_test_indicators = ["junit", "JUnit", "testng", "TestNG", "@Test", "@Test("]
-        for f in repo.rglob("*"):
+        for f in _scan_files(repo):
             if f.is_file() and f.suffix in {".java", ".kt"}:
                 try:
                     content = f.read_text()
@@ -536,7 +566,7 @@ class ProjectAdapter:
 
         # Check for seed scripts
         seed_indicators = ["seed", "seed-data", "seed-data"]
-        for f in target.rglob("*"):
+        for f in _scan_files(target):
             if f.is_file() and f.suffix in {".js", ".ts", ".py", ".sh"}:
                 try:
                     content = f.read_text().lower()
