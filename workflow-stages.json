@@ -1,6 +1,6 @@
 {
-  "comment": "Minimal machine-readable stage order extracted from orchestrator/workflow.md. The workflow.md remains the source of truth for stage definitions, handoffs, safety gates, and state machine logic. This file exists only because parsing Markdown for stage order is unreliable and impractical for a runtime.",
-  "version": "0.1.0",
+  "comment": "Machine-readable stage order extracted from orchestrator/workflow.md. The workflow.md remains the source of truth for stage definitions, handoffs, safety gates, and state machine logic. This file exists only because parsing Markdown for stage order is unreliable and impractical for a runtime.",
+  "version": "0.2.0",
   "stages": [
     "story-intake",
     "discovery",

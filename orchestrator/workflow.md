@@ -293,7 +293,7 @@ The orchestrator passes the grill output to the Risk Analysis stage. The risk st
 
 ### Stage 5 — Risk Analysis
 
-**Responsible:** QA Orchestrator, using the grill output and analyst output
+**Responsible:** Risk Analysis Agent (`agents/risk/AGENT.md`), invoked by the QA Orchestrator
 
 **Required inputs:**
 - The grill output.

@@ -1,0 +1,8 @@
+# QA Agent Harness — Runtime Dependencies
+# Install: pip install -r requirements.txt
+
+PyYAML>=6.0.1
+# Note: json is stdlib — no pin needed
+# Note: datetime is stdlib — no pin needed
+# Note: pathlib is stdlib — no pin needed
+# Note: subprocess is stdlib — no pin needed

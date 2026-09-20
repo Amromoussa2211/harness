@@ -20,11 +20,14 @@ database:
   enabled: false
   type: none
 
-performance:
-  enabled: false
-
-security:
-  enabled: false
+target_repository:
+  # Path to the target project repository (relative to harness root or absolute).
+  # Leave empty or omit if the target is the same as the Harness project directory.
+  # Example: ../my-app-repo
+  path: ../demo-target-project
+  # When true, the adapter treats this as a CI workspace checkout.
+  # CI workflows may inject paths at runtime instead of static config.
+  ci_workspace: false
 
 ci:
   provider: none

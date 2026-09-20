@@ -1,0 +1,12 @@
+{
+  "comment": "Project adapter module for target project integration.",
+  "version": "1.0.0",
+  "adapters": [
+    {
+      "name": "project_adapter",
+      "path": "adapters/project_adapter.py",
+      "class": "ProjectAdapter",
+      "description": "Discovers and interacts with a target project repository. Provides capability detection, environment discovery, safe command execution, and artifact contracts."
+    }
+  ]
+}

@@ -1,11 +1,11 @@
 project:
-  name: demo
-  description: Demo project used to validate the QA Agent Harness
+  name: PROJECT_NAME
+  description: PROJECT_DESCRIPTION
 
 application:
   web: true
-  mobile: false
   api: true
+  mobile: false
 
 automation:
   framework: playwright
@@ -26,6 +26,14 @@ performance:
 security:
   enabled: false
 
+accessibility: false
+
+visual: false
+
+events: false
+
+webhooks: false
+
 ci:
   provider: none
 
@@ -38,3 +46,12 @@ safety:
   production_execution: false
   real_payments: false
   destructive_database_operations: false
+
+test_data:
+  fixtures: false
+  generated: false
+
+secrets:
+  credentials: false
+  api_keys: false
+  certificates: false
