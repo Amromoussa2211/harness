@@ -1,0 +1,40 @@
+project:
+  name: demo
+  description: Demo project for QA Harness workflow validation
+
+application:
+  web: true
+  mobile: false
+  api: true
+
+automation:
+  framework: playwright
+  language: javascript
+
+api:
+  rest: true
+  graphql: false
+  webhooks: false
+
+database:
+  enabled: false
+  type: none
+
+performance:
+  enabled: false
+
+security:
+  enabled: false
+
+ci:
+  provider: none
+
+environments:
+  dev: false
+  staging: false
+  production: false
+
+safety:
+  production_execution: false
+  real_payments: false
+  destructive_database_operations: false

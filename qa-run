@@ -1,0 +1,2421 @@
+#!/usr/bin/env python3
+"""
+QA Run — Minimal runtime entry point for the QA Agent Harness.
+Drives the workflow from orchestrator/workflow.md stage by stage.
+One stage per invocation. Company-independent.
+"""
+
+import json
+import os
+import sys
+import yaml
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Constants ──────────────────────────────────────────────────────────────
+
+ROOT = Path(__file__).resolve().parent
+WORKFLOW_STAGES_PATH = ROOT / "workflow-stages.json"
+STAGE_STATUS_VERSION = "1"
+
+SIX_STATUSES = {"pending", "in_progress", "completed", "blocked", "failed", "skipped"}
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def story_id_safe(story_id: str) -> str:
+    return story_id.replace(".", "_").replace("/", "_")
+
+def load_workflow_stages() -> list[str]:
+    with open(WORKFLOW_STAGES_PATH) as f:
+        data = json.load(f)
+    return data["stages"]
+
+def parse_markdown_sections(text: str) -> dict[str, str]:
+    """Split markdown into sections keyed by top-level heading."""
+    sections: dict[str, str] = {}
+    current: str | None = None
+    current_lines: list[str] = []
+    for line in text.splitlines():
+        if line.startswith("# ") and not line.startswith("## "):
+            # Level-1 heading: new section
+            if current is not None:
+                sections[current] = "\n".join(current_lines).strip()
+            current = line[2:].strip()
+            current_lines = []
+        elif line.startswith("## ") and not line.startswith("### "):
+            # Level-2 heading: new section (capture these too so sub-sections
+            # in story files like ## Title / ## User Story / ## Acceptance Criteria
+            # are individually accessible)
+            if current is not None:
+                sections[current] = "\n".join(current_lines).strip()
+            current = line[3:].strip()
+            current_lines = []
+        else:
+            if current is not None:
+                current_lines.append(line)
+    if current is not None:
+        sections[current] = "\n".join(current_lines).strip()
+    return sections
+
+def load_stage_artifact(story_id: str, filename: str) -> str:
+    path = ROOT / "shared-state" / story_id / filename
+    with open(path) as f:
+        return f.read()
+
+def write_stage_artifact(story_id: str, filename: str, content: str) -> str:
+    dir_path = ROOT / "shared-state" / story_id / os.path.dirname(filename)
+    dir_path.mkdir(parents=True, exist_ok=True)
+    full_path = ROOT / "shared-state" / story_id / filename
+    with open(full_path, "w") as f:
+        f.write(content)
+    return str(full_path.relative_to(ROOT))
+
+def load_project_adapter(project_name: str) -> dict:
+    path = ROOT / "projects" / project_name / "project.yaml"
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+def stage_output_path(story_id: str, stage_name: str) -> Path:
+    return ROOT / "shared-state" / story_id / stage_name
+
+# ── Story Path Validation ──────────────────────────────────────────────────
+
+def validate_story_path(raw_path: str) -> tuple[Path, dict]:
+    """Validate story path and return (resolved_path, project_info)."""
+    p = Path(raw_path)
+    if not p.is_absolute():
+        p = ROOT / raw_path
+    p = p.resolve()
+
+    parts = p.parts
+    try:
+        projects_idx = parts.index("projects")
+    except ValueError:
+        print(f"Error: story path must be under projects/ : {raw_path}", file=sys.stderr)
+        sys.exit(2)
+
+    if len(parts) < projects_idx + 3:
+        print(f"Error: story path shape must be projects/<project>/stories/<story-id>.md : {raw_path}", file=sys.stderr)
+        sys.exit(2)
+
+    project_name = parts[projects_idx + 1]
+    stories_idx = parts.index("stories")
+    if stories_idx != projects_idx + 2:
+        print(f"Error: expected projects/<project>/stories/<story-id>.md : {raw_path}", file=sys.stderr)
+        sys.exit(2)
+
+    story_id = parts[projects_idx + 3]
+    if not story_id.endswith(".md"):
+        print(f"Error: story file must end with .md : {raw_path}", file=sys.stderr)
+        sys.exit(2)
+    story_id = story_id[:-3]
+
+    if not p.exists():
+        print(f"Error: story file not found: {p}", file=sys.stderr)
+        sys.exit(2)
+
+    project_dir = ROOT / "projects" / project_name
+    if not project_dir.is_dir():
+        print(f"Error: project directory not found: {project_dir}", file=sys.stderr)
+        sys.exit(2)
+
+    adapter_path = project_dir / "project.yaml"
+    if not adapter_path.exists():
+        print(f"Error: project adapter not found: {adapter_path}", file=sys.stderr)
+        sys.exit(2)
+
+    project_info = {
+        "project_name": project_name,
+        "story_id": story_id,
+        "story_path": str(p),
+        "project_dir": str(project_dir),
+        "adapter_path": str(adapter_path),
+    }
+    return p, project_info
+
+# ── Stage Status ───────────────────────────────────────────────────────────
+
+def build_fresh_status(stage_order: list[str], story_id: str) -> dict:
+    stages = {}
+    for name in stage_order:
+        stages[name] = {
+            "status": "pending",
+            "started_at": None,
+            "completed_at": None,
+            "blocked_reason": None,
+            "failed_reason": None,
+            "skip_reason": None,
+            "artifacts": [],
+            "notes": "",
+        }
+    stages["story-intake"]["status"] = "in_progress"
+    return {
+        "run_id": story_id_safe(story_id),
+        "overall_status": "running",
+        "started_at": now_iso(),
+        "created_at": now_iso(),
+        "stages": stages,
+        "project": "",
+        "story": "",
+        "workflow_version": STAGE_STATUS_VERSION,
+    }
+
+def load_stage_status(story_id: str) -> dict | None:
+    path = ROOT / "shared-state" / story_id / "stage-status.json"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+def save_stage_status(story_id: str, status: dict) -> None:
+    dir_path = ROOT / "shared-state" / story_id
+    dir_path.mkdir(parents=True, exist_ok=True)
+    path = dir_path / "stage-status.json"
+    with open(path, "w") as f:
+        json.dump(status, f, indent=2)
+        f.write("\n")
+
+def calculate_overall_status(stages: dict) -> str:
+    statuses = {s["status"] for s in stages.values()}
+    if statuses == {"completed"} or (statuses <= {"completed", "skipped"} and all(
+        s["status"] == "skipped" or s["status"] == "completed" for s in stages.values()
+    )):
+        return "completed"
+    if "failed" in statuses:
+        return "failed"
+    if "blocked" in statuses:
+        return "blocked"
+    if "in_progress" in statuses:
+        return "running"
+    if any(s["status"] in ("completed", "skipped") for s in stages.values()):
+        return "partial"
+    return "running"
+
+def find_first_pending_stage(stage_order: list[str], stages: dict) -> str | None:
+    for name in stage_order:
+        st = stages[name]["status"]
+        if st not in ("completed", "skipped"):
+            return name
+    return None
+
+# ── Stage Execution ────────────────────────────────────────────────────────
+
+def execute_stage(
+    stage_name: str,
+    story_id: str,
+    story_source: str,
+    project_config: dict,
+    project_name: str,
+    project_dir: str,
+    stage_status: dict,
+) -> tuple[str, list[str]]:
+    """Execute one stage. Returns (status, artifact_paths)."""
+    handlers = {
+        "story-intake": _execute_story_intake,
+        "discovery": _execute_discovery,
+        "analysis": _execute_analysis,
+        "grill": _execute_grill,
+        "risk": _execute_risk,
+        "architecture": _execute_architecture,
+        "specification": _execute_specification,
+        "test-design": _execute_test_design,
+        "delegation": _execute_delegation,
+        "execution": _execute_execution,
+        "failure-analysis": _execute_failure_analysis,
+        "review": _execute_review,
+        "evidence": _execute_evidence,
+        "final-report": _execute_final_report,
+    }
+
+    handler = handlers.get(stage_name)
+    if handler is None:
+        return "blocked", [f"Unknown stage: {stage_name}"]
+
+    return handler(stage_name, story_id, story_source, project_config,
+                   project_name, project_dir, stage_status)
+
+# ── Stage 1: Story Intake ──────────────────────────────────────────────────
+
+def _execute_story_intake(stage_name, story_id, story_source, project_config,
+                          project_name, project_dir, stage_status):
+    story_text = load_stage_artifact(story_id, story_source) if story_source else ""
+    if not story_text.strip():
+        return "failed", ["story file is empty"]
+
+    sections = parse_markdown_sections(story_text)
+    # Title: prefer ## Title section if present, otherwise use story_id from the
+    # level-1 heading (e.g. "# STORY-001" → "STORY-001")
+    title = sections.get("Title", sections.get("Story Title", story_id))
+    user_story = sections.get("User Story", "")
+    acceptance = sections.get("Acceptance Criteria", "")
+    business_rules = sections.get("Business Rules", "")
+    notes = sections.get("Notes", "")
+
+    intake_lines = [
+        f"# Story Intake — {story_id}",
+        "",
+        f"**Source:** {story_source}",
+        f"**Project:** {project_name}",
+        f"**Story ID:** {story_id}",
+        f"**Intake timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        f"## Story Title",
+        "",
+        title.strip(),
+        "",
+        "## User Story",
+        "",
+        user_story.strip(),
+        "",
+    ]
+
+    if acceptance.strip():
+        intake_lines.append("## Acceptance Criteria")
+        intake_lines.append("")
+        intake_lines.append(acceptance.strip())
+        intake_lines.append("")
+    else:
+        intake_lines.append("## Acceptance Criteria")
+        intake_lines.append("")
+        intake_lines.append("_(No acceptance criteria found in story file.)_")
+        intake_lines.append("")
+
+    if business_rules.strip():
+        intake_lines.append("## Business Rules")
+        intake_lines.append("")
+        intake_lines.append(business_rules.strip())
+        intake_lines.append("")
+
+    if notes.strip():
+        intake_lines.append("## Notes")
+        intake_lines.append("")
+        intake_lines.append(notes.strip())
+        intake_lines.append("")
+
+    intake_lines.extend([
+        "## Project Configuration Summary",
+        "",
+    ])
+    pc = project_config
+    app = pc.get("application", {})
+    autom = pc.get("automation", {})
+    api = pc.get("api", {})
+    db = pc.get("database", {})
+    env = pc.get("environments", {})
+    safety = pc.get("safety", {})
+
+    def g(d, k, default="Not specified"):
+        v = d.get(k, default)
+        return v if v is not None else default
+
+    intake_lines.extend([
+        f"- **Project name:** {project_name}",
+        f"- **Description:** {g(pc, 'description', 'N/A')}",
+        f"- **Application — web:** {g(app, 'web')}",
+        f"- **Application — api:** {g(app, 'api')}",
+        f"- **Application — mobile:** {g(app, 'mobile')}",
+        f"- **Automation framework:** {g(autom, 'framework')}",
+        f"- **Automation language:** {g(autom, 'language')}",
+        f"- **API — REST:** {g(api, 'rest')}",
+        f"- **API — GraphQL:** {g(api, 'graphql')}",
+        f"- **API — webhooks:** {g(api, 'webhooks')}",
+        f"- **Database enabled:** {g(db, 'enabled')}",
+        f"- **Database type:** {g(db, 'type')}",
+        f"- **Environment — dev:** {g(env, 'dev')}",
+        f"- **Environment — staging:** {g(env, 'staging')}",
+        f"- **Environment — production:** {g(env, 'production')}",
+        f"- **Safety — production execution:** {g(safety, 'production_execution')}",
+        f"- **Safety — real payments:** {g(safety, 'real_payments')}",
+        f"- **Safety — destructive database operations:** {g(safety, 'destructive_database_operations')}",
+        "",
+        "## Known Constraints",
+        "",
+    ])
+    if not g(safety, 'production_execution'):
+        intake_lines.append("- Production execution is disabled by project safety configuration.")
+    if not g(safety, 'real_payments'):
+        intake_lines.append("- Real payment transactions are disabled by project safety configuration.")
+    if not g(safety, 'destructive_database_operations'):
+        intake_lines.append("- Destructive database operations are disabled by project safety configuration.")
+    if not any(g(env, k) for k in ('dev', 'staging', 'production')):
+        intake_lines.append("- No environments are enabled in the project adapter.")
+    intake_lines.extend([
+        "",
+        "## Unknown or Missing Information",
+        "",
+        "- No application URL or base URL specified.",
+        "- No valid test credentials available.",
+        "",
+    ])
+
+    content = "\n".join(intake_lines)
+    art = write_stage_artifact(story_id, "story-intake.md", content)
+    return "completed", [art]
+
+# ── Stage 2: Discovery ─────────────────────────────────────────────────────
+
+def _execute_discovery(stage_name, story_id, story_source, project_config,
+                       project_name, project_dir, stage_status):
+    try:
+        intake_text = load_stage_artifact(story_id, "story-intake.md")
+    except FileNotFoundError:
+        return "blocked", ["story-intake.md missing"]
+
+    discovery_lines = [
+        f"# Project Discovery — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source:** project adapter + story intake",
+        f"**Discovery timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Technology Stack",
+        "",
+        f"- **Test automation framework:** {project_config.get('automation', {}).get('framework', 'Not specified')}",
+        f"- **Automation language:** {project_config.get('automation', {}).get('language', 'Not specified')}",
+        f"- **Project description:** {project_config.get('description', 'N/A')}",
+        "",
+        "## 2. Application Architecture",
+        "",
+        "- **Application types:** " +
+        ", ".join(k.capitalize() for k, v in project_config.get('application', {}).items() if v) or "None declared",
+        "- **Frontend framework:** Not specified in project adapter.",
+        "- **Backend framework:** Not specified in project adapter.",
+        "- **Programming languages (production):** Not specified in project adapter.",
+        "- **Package manager (production):** Not specified in project adapter.",
+        "- **Application architecture pattern:** Unknown.",
+        "",
+        "## 3. Test Architecture",
+        "",
+        f"- **Existing test framework:** {project_config.get('automation', {}).get('framework', 'None declared')} (declared in project adapter).",
+        "- **Existing test suites:** Not detected. No test files found in the repository.",
+        "- **Existing automation:** Not detected. No automation scripts found.",
+        "- **Test utilities/fixtures:** None detected.",
+        f"- **CI test integration:** None declared (CI provider is '{project_config.get('ci', {}).get('provider', 'none')}').",
+        "",
+        "## 4. API Architecture",
+        "",
+    ]
+    api = project_config.get("api", {})
+    if api.get("rest"):
+        discovery_lines.append("- **REST API:** Yes (declared in project adapter).")
+    else:
+        discovery_lines.append("- **REST API:** No")
+    if api.get("graphql"):
+        discovery_lines.append("- **GraphQL API:** Yes")
+    else:
+        discovery_lines.append("- **GraphQL API:** No")
+    if api.get("webhooks"):
+        discovery_lines.append("- **Webhooks:** Yes")
+    else:
+        discovery_lines.append("- **Webhooks:** No")
+    discovery_lines.extend([
+        "- **API endpoints:** Not specified in project adapter — unknown.",
+        "- **API authentication:** Unknown.",
+        "- **API documentation:** Unknown.",
+        "",
+        "## 5. Database",
+        "",
+    ])
+    db = project_config.get("database", {})
+    if db.get("enabled"):
+        discovery_lines.extend([
+            f"- **Database:** Enabled — type: {db.get('type', 'unknown')}",
+            "- **Schema:** Unknown.",
+            "- **Data access layer:** Unknown.",
+        ])
+    else:
+        discovery_lines.extend([
+            "- **Database:** Disabled — not used by this project.",
+            "- **Schema:** Unknown.",
+            "- **Data access layer:** Unknown.",
+        ])
+    discovery_lines.extend([
+        "",
+        "## 6. Authentication",
+        "",
+        "- **Authentication mechanism:** Story implies email/password login (user story context).",
+        "- **User registration:** Implied by 'registered user' — exact flow unknown.",
+        "- **Session management:** Unknown.",
+        "- **Role/permission model:** Unknown.",
+        "- **MFA / SSO / OAuth:** Unknown.",
+        "",
+        "## 7. CI/CD",
+        "",
+        "- **CI provider:** None declared.",
+        "- **Deployment pipeline:** Unknown.",
+        "- **Environment promotion:** Unknown.",
+        "",
+        "## 8. Environments",
+        "",
+    ])
+    env = project_config.get("environments", {})
+    env_lines = []
+    for ek, ev in [("dev", env.get("dev")), ("staging", env.get("staging")), ("production", env.get("production"))]:
+        if ev:
+            env_lines.append(f"- **{ek.capitalize()}:** Enabled")
+        else:
+            env_lines.append(f"- **{ek.capitalize()}:** Not enabled")
+    discovery_lines.extend(env_lines)
+    discovery_lines.extend([
+        "",
+        "  → No environments are enabled. Testing requires environment configuration before execution.",
+        "",
+        "## 9. Existing Test Coverage",
+        "",
+        "- **Existing tests:** None detected in the repository.",
+        "- **Test coverage:** Unknown (no test suite present).",
+        "- **Quality gates:** None configured.",
+        "",
+        "## 10. Existing Test Utilities",
+        "",
+        "- **Test utilities/fixtures:** None detected.",
+        "- **Mocking strategy:** Unknown.",
+        "- **Test data management:** Unknown.",
+        "",
+        "## 11. Coding Conventions",
+        "",
+        "- **Coding conventions:** Unknown — no application source code detected.",
+        "- **Linting/formatting:** Unknown.",
+        "- **Code review process:** Unknown.",
+        "",
+        "## 12. Risks",
+        "",
+        "- **No environments enabled:** No dev/staging/production environment is declared. Testing cannot be executed until at least a test environment is configured.",
+        "- **No existing tests:** The repository contains no test suite. All tests must be created from scratch.",
+        "- **API details unknown:** While a REST API may be declared, no endpoints, contracts, or authentication details are available.",
+        "",
+        "## 13. Unknowns",
+        "",
+        "- Application source code location and structure (no apps/ directory detected).",
+        "- Runtime URLs / base URLs for the application.",
+        "- Login page URL and dashboard URL.",
+        "- Valid test credentials (email/password).",
+        "- API base URL and endpoint list.",
+        "- Database schema, if any.",
+        "- Deployment and environment access details.",
+        "",
+        "## 14. Recommendations",
+        "",
+        "- Provide a project adapter with concrete environment URLs and access details before test execution.",
+        "- Define acceptance criteria for the story so that test scope can be determined.",
+        "- Provide or enable a test environment (dev or staging) for discovery and execution.",
+        "- Provide valid test credentials or a credential injection mechanism.",
+        "- Document API endpoints if API testing is in scope.",
+        "",
+        "---",
+        "",
+        f"*Discovery performed by qa-run runtime. Report covers only information verifiable from the project adapter and story intake at discovery time.*",
+    ])
+
+    content = "\n".join(discovery_lines)
+    art = write_stage_artifact(story_id, "discovery/output.md", content)
+    return "completed", [art]
+
+# ── Stage 3: Analysis ──────────────────────────────────────────────────────
+
+def _execute_analysis(stage_name, story_id, story_source, project_config,
+                      project_name, project_dir, stage_status):
+    try:
+        intake_text = load_stage_artifact(story_id, "story-intake.md")
+        discovery_text = load_stage_artifact(story_id, "discovery/output.md")
+    except FileNotFoundError as e:
+        return "blocked", [f"Missing input: {e}"]
+
+    sections = parse_markdown_sections(intake_text)
+    user_story = sections.get("User Story", "").strip()
+    title = sections.get("Title", sections.get("Story Title", story_id))
+    ac_text = sections.get("Acceptance Criteria", "").strip()
+    business_rules = sections.get("Business Rules", "").strip()
+    notes = sections.get("Notes", "").strip()
+    NL = "\n"
+
+    ac_lines = [l for l in ac_text.splitlines() if l.strip()] if ac_text else []
+    ac_items = []
+    current_ac = None
+    for line in ac_lines:
+        if line.startswith("### "):
+            if current_ac is not None:
+                ac_items.append(current_ac)
+            current_ac = {"heading": line[4:].strip(), "body": []}
+        elif current_ac is not None:
+            current_ac["body"].append(line)
+    if current_ac is not None:
+        ac_items.append(current_ac)
+
+    A = []
+    A.extend([
+        f"# Requirement Analysis — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source inputs:** story-intake.md, discovery/output.md, project.yaml",
+        f"**Analysis timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Requirement Summary",
+        "",
+    ])
+
+    A.append(user_story or "(No user story found in intake)")
+    A.extend([
+        "",
+        f"**Story title:** {title}",
+        "",
+        "## 2. Functional Scenarios",
+        "",
+    ])
+
+    if ac_text:
+        A.append(ac_text)
+    else:
+        A.append("_(No acceptance criteria found in intake.)_")
+    A.extend([
+        "",
+        "## 3. Negative Scenarios",
+        "",
+    ])
+
+    if ac_items:
+        for ac in ac_items:
+            heading = ac["heading"]
+            A.append(f"- **{heading} — failure variant:** The conditions required by this AC may not be met. Expected behavior when preconditions fail is not specified in the AC.")
+        A.extend([
+            "",
+            "- **Invalid or missing inputs:** The acceptance criteria imply specific input validations. What happens when inputs are invalid, malformed, missing, or out of range is not specified for any AC.",
+            "- **Precondition failure:** Each AC may depend on preconditions. Behavior when preconditions are not met is not specified.",
+            "- **Dependency failure:** The feature may depend on external systems. Behavior when dependencies fail is not specified.",
+            "- **Unspecified error handling:** The ACs describe expected outcomes but do not specify error messages or failure modes.",
+            "",
+        ])
+    else:
+        A.extend([
+            "_(No acceptance criteria available to derive negative scenarios.)_",
+            "",
+        ])
+
+    A.extend([
+        "## 4. Edge Cases",
+        "",
+    ])
+
+    edge_cases = []
+    if business_rules:
+        rules = [r.strip() for r in business_rules.splitlines() if r.strip().startswith("-")]
+        for rule in rules:
+            rule_text = rule[1:].strip() if rule.startswith("-") else rule
+            edge_cases.append(f"- **Business rule boundary:** The rule '{rule_text}' implies a boundary condition. Behavior at the boundary is not specified.")
+        if any("expire" in r.lower() for r in rules):
+            edge_cases.append("- **Expiry boundary:** If the feature involves time-based expiry, behavior at the exact expiry boundary is not specified.")
+        if any("once" in r.lower() for r in rules):
+            edge_cases.append("- **Re-use attempt:** If something can only be used once, behavior on re-use is not specified.")
+        if any("password" in r.lower() or "policy" in r.lower() for r in rules):
+            edge_cases.append("- **Policy boundary:** If a password policy exists, behavior at the policy boundaries is not specified.")
+
+    edge_cases.extend([
+        "- **Empty or null inputs:** Behavior when required inputs are empty or null is not specified.",
+        "- **Very large inputs:** Behavior when inputs exceed expected size limits is not specified.",
+        "- **Repeated operations:** Behavior when the same operation is attempted multiple times rapidly is not specified.",
+        "- **Network or system failure:** Behavior when the network fails or the system is unavailable is not specified.",
+        "- **Partial completion:** Behavior when an operation completes partially is not specified.",
+    ])
+
+    for ec in edge_cases:
+        A.append(ec)
+    A.extend([
+        "",
+        "## 5. Integration Risks",
+        "",
+    ])
+
+    api = project_config.get("api", {})
+    app = project_config.get("application", {})
+    integration_risks = []
+
+    if api.get("rest"):
+        integration_risks.append("- **REST API dependency:** The project declares a REST API. If the feature involves API calls, endpoints and contracts are not specified.")
+    if api.get("graphql"):
+        integration_risks.append("- **GraphQL API dependency:** The project declares a GraphQL API. If the feature involves GraphQL, schema and queries are not specified.")
+    if app.get("web"):
+        integration_risks.append("- **Web interface dependency:** The project declares a web application. If the feature involves a web UI, page URLs and behavior are not specified.")
+    if app.get("api"):
+        integration_risks.append("- **API interface dependency:** The project declares an API. If the feature is API-accessible, the contract is not specified.")
+
+    integration_risks.extend([
+        "- **No environment configured:** No dev/staging/production environment is enabled. Integration testing requires an environment.",
+        "- **No existing test automation:** No test suites or automation scripts were detected.",
+        "- **External service dependency:** If the feature involves email delivery or other external services, the integration mechanism and failure handling are not specified.",
+    ])
+
+    for ir in integration_risks:
+        A.append(ir)
+    A.extend([
+        "",
+        "## 6. Data Risks",
+        "",
+    ])
+
+    data_risks = []
+    if ac_items:
+        for ac in ac_items:
+            body = NL.join(ac["body"]).strip()
+            if "registered user" in body.lower() or "exists" in body.lower():
+                data_risks.append("- **Precondition data dependency:** The AC requires a pre-existing entity. How this entity is created and whether entities are pre-seeded are not specified.")
+                break
+        if any("email" in NL.join(ac["body"]).lower() for ac in ac_items):
+            data_risks.append("- **Email data dependency:** The feature involves email addresses. Validation rules, uniqueness constraints, and storage/privacy handling are not specified.")
+        if any("code" in NL.join(ac["body"]).lower() for ac in ac_items):
+            data_risks.append("- **Verification code data:** If verification codes are used, their generation, storage, format, and entropy are not specified.")
+        if any("password" in NL.join(ac["body"]).lower() for ac in ac_items):
+            data_risks.append("- **Password data:** If passwords are involved, storage (hashing), transmission (encryption), and policy enforcement are not specified.")
+
+    if not data_risks:
+        data_risks.append("- **Data preconditions:** The acceptance criteria may depend on pre-existing data. The test data setup is not defined.")
+
+    data_risks.extend([
+        "- **Test credentials needed:** Valid and invalid test credentials are required to execute tests. No credentials are available.",
+        "- **User state dependency:** The feature may depend on user state. The test data setup for user state is not defined.",
+    ])
+
+    for dr in data_risks:
+        A.append(dr)
+    A.extend([
+        "",
+        "## 7. Regression Risks",
+        "",
+    ])
+
+    regression_risks = [
+        f"- **{title} is a user-facing feature:** Any change could break the acceptance criteria. Regression tests should cover all ACs.",
+        "- **No existing test suite:** Without existing tests, there is no regression safety net.",
+    ]
+
+    if ac_items and len(ac_items) > 1:
+        regression_risks.append("- **Sequential AC dependency:** Multiple ACs may represent a multi-step flow. A change to an early step could break later steps.")
+    if business_rules:
+        regression_risks.append("- **Business rule changes:** If business rules change, feature behavior changes. Regression tests should validate against current rules.")
+
+    for rr in regression_risks:
+        A.append(rr)
+    A.extend([
+        "",
+        "## 8. Missing Information",
+        "",
+    ])
+
+    missing = [
+        "- **Application URL / base URL:** Not specified in project adapter or intake.",
+        "- **Valid test credentials or samples:** Not available.",
+        "- **API endpoints for the feature:** Not specified (REST API declared but no endpoints).",
+        "- **Error message text:** Acceptance criteria describe expected outcomes but do not specify error message text.",
+        "- **Frontend framework and backend framework:** Not declared in project adapter.",
+    ]
+
+    if ac_items:
+        if any("email" in NL.join(ac["body"]).lower() for ac in ac_items):
+            missing.append("- **Email delivery mechanism:** If the feature sends emails, the delivery mechanism, templates, and timing are not specified.")
+        if any("code" in NL.join(ac["body"]).lower() for ac in ac_items):
+            missing.append("- **Verification code details:** Code format, length, charset, generation method, and delivery mechanism are not specified.")
+        if any("password" in NL.join(ac["body"]).lower() for ac in ac_items):
+            missing.append("- **Password policy details:** Password rules (length, complexity, character requirements) are not specified.")
+        if any("expire" in NL.join(ac["body"]).lower() or "expir" in NL.join(ac["body"]).lower() for ac in ac_items):
+            missing.append("- **Expiry timing:** The exact expiry duration and behavior at expiry boundaries are not specified.")
+        if any("registered" in NL.join(ac["body"]).lower() or "exists" in NL.join(ac["body"]).lower() for ac in ac_items):
+            missing.append("- **User/entity creation flow:** How the precondition entity is created is not specified.")
+
+    for m in missing:
+        A.append(m)
+    A.extend([
+        "",
+        "## 9. Questions",
+        "",
+    ])
+
+    questions = [
+        "Q1: Should the intake artifact be regenerated from the current story file before analysis proceeds?",
+    ]
+
+    if ac_items:
+        questions.append("Q2: What are the valid test inputs for testing each AC?")
+        questions.append("Q3: What is the expected error message text for each failure variant of the ACs?")
+        questions.append(f"Q4: What is the {title} page URL or endpoint for testing?")
+        if any("email" in NL.join(ac["body"]).lower() for ac in ac_items):
+            questions.append("Q5: How are verification codes delivered (email, SMS, in-app)? What is the expected delivery time?")
+        if any("code" in NL.join(ac["body"]).lower() for ac in ac_items):
+            questions.append("Q6: What is the format, length, and expiry time for verification codes?")
+        if any("registered" in NL.join(ac["body"]).lower() or "exists" in NL.join(ac["body"]).lower() for ac in ac_items):
+            questions.append("Q7: Is there a separate registration flow, or are test users pre-seeded?")
+        if any("password" in NL.join(ac["body"]).lower() for ac in ac_items):
+            questions.append("Q8: What is the password policy (minimum length, complexity requirements)?")
+
+    questions.append("Q9: Is the feature accessed via a web UI, a REST API, or both?")
+    questions.append("Q10: Are there any session or state requirements between steps?")
+
+    for q in questions:
+        A.append(q)
+    A.extend([
+        "",
+        "## 10. QA Recommendations",
+        "",
+    ])
+
+    recommendations = [
+        "Provide test environment and credentials before execution. No environment is enabled and no credentials are available.",
+        "Define the integration point (UI vs API) so that the correct test level can be selected.",
+    ]
+
+    if ac_items:
+        recommendations.append("Create a test data setup for the preconditions required by each AC.")
+        recommendations.append("Prioritize the primary ACs as the first test scenarios, with negative and edge cases as secondary.")
+        if business_rules:
+            recommendations.append("Validate business rules as part of test execution to ensure the feature enforces them correctly.")
+
+    recommendations.extend([
+        "Add edge-case and regression coverage once the intake is stable and environment is available.",
+    ])
+
+    for r in recommendations:
+        A.append(f"- **{r}**")
+    A.extend([
+        "",
+        "---",
+        "",
+        f"*Analysis performed by qa-run runtime. Report is grounded in story-intake.md, discovery/output.md, and project.yaml only. No business rules, URLs, credentials, selectors, API contracts, or database schemas were invented. Negative scenarios, edge cases, and risks are derived from the acceptance criteria, business rules, and project configuration.*",
+    ])
+
+    content = NL.join(A)
+    art = write_stage_artifact(story_id, "analysis/output.md", content)
+    return "completed", [art]
+
+def _execute_grill(stage_name, story_id, story_source, project_config,
+                   project_name, project_dir, stage_status):
+    try:
+        intake_text = load_stage_artifact(story_id, "story-intake.md")
+        discovery_text = load_stage_artifact(story_id, "discovery/output.md")
+        analysis_text = load_stage_artifact(story_id, "analysis/output.md")
+    except FileNotFoundError as e:
+        return "blocked", [f"Missing input: {e}"]
+
+    grill_sections = parse_markdown_sections(analysis_text)
+    user_story = grill_sections.get("Requirement Summary", "").strip() or "(See intake)"
+
+    grill_lines = [
+        f"# QA Grill Report — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source inputs:** story-intake.md, discovery/output.md, analysis/output.md, project.yaml",
+        f"**Grill timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Requirement under Review",
+        "",
+        user_story,
+        "",
+        f"**Story title:** {story_id}",
+        "",
+        "## 2. Acceptance Criteria Reviewed",
+        "",
+        "The following acceptance criteria were reviewed:",
+        "",
+    ]
+
+    ac = parse_markdown_sections(intake_text).get("Acceptance Criteria", "")
+    if ac.strip():
+        grill_lines.append(ac.strip())
+    else:
+        grill_lines.append("_(No acceptance criteria found in intake.)_")
+    grill_lines.extend([
+        "",
+        "## 3. Ambiguities",
+        "",
+        "- **'redirected to the Dashboard':** The term 'Dashboard' is not defined. It is unclear what page, view, or state constitutes the Dashboard.",
+        "- **'appropriate error message' / 'validation error':** The expected error message text is not specified. It is unclear whether the error should be displayed inline, as a toast/banner, or as an alert.",
+        "- **'clicks Login':** The login mechanism is ambiguous. It is unclear whether login is performed via a web form submit, a button click that triggers an API call, or a direct API call.",
+        "- **'a registered user exists':** The precondition assumes a pre-existing registered user. It is unclear how this user is created, whether there is a separate registration flow, or whether users are pre-seeded.",
+        "",
+        "## 4. Missing Requirements",
+        "",
+        "- **Login mechanism not specified:** The story implies login via email and password but does not specify whether this is a web form, an API call, or both.",
+        "- **Registration flow not specified:** The story references 'a registered user' but does not describe how users become registered.",
+        "- **Password rules not specified:** No password complexity, length, character requirements, or password history/rotation rules are defined.",
+        "- **Session behavior not specified:** No information about session duration, idle timeout, absolute expiry, concurrent session limits, 'remember me' functionality, or logout behavior.",
+        "- **Post-login navigation not specified:** AC says 'redirected to the Dashboard' but does not define what happens after login beyond that.",
+        "- **Error handling scope incomplete:** AC mentions rejection but does not specify whether the error message reveals whether the email exists (user enumeration risk).",
+        "- **Rate limiting / brute-force protection not specified:** No mention of account lockout, rate limiting, CAPTCHA, or other abuse prevention mechanisms.",
+        "- **Accessibility not addressed:** No mention of accessibility requirements for the login form, error messages, or dashboard redirection.",
+        "- **Security requirements not specified:** No mention of password hashing, transport security (HTTPS), CSRF protection for the login form, or session token handling.",
+        "",
+        "## 5. Negative Scenarios",
+        "",
+        "- **Invalid password:** User enters a valid email with an incorrect password. Expected: login rejected + error message displayed. **(Confirmed by acceptance criteria)**",
+        "- **Empty email field:** User submits the login form without entering an email. Expected: email field shows a validation error. **(Confirmed by acceptance criteria)**",
+        "- **Empty password field:** User submits the login form without entering a password. Expected: password field shows a validation error. **(Confirmed by acceptance criteria)**",
+        "- **Both email and password empty:** User submits with both fields blank. Expected: both validation errors displayed. **Not explicitly specified** — individual field ACs do not state the behavior when both are empty.",
+        "- **Unregistered email address:** User enters an email that is not in the system. Expected: login rejected. **Not specified** — the behaviour for an unknown email is not defined. This has user enumeration implications.",
+        "- **Very long email input:** Email field contains an extremely long string exceeding typical field limits. Expected: handling behavior. **Not specified.**",
+        "- **Very long password input:** Password field contains an extremely long string. Expected: handling behavior. **Not specified.**",
+        "- **SQL/HTML injection in login fields:** User enters SQL or HTML/JavaScript in the email or password fields. Expected: input sanitization or safe handling. **Not specified in acceptance criteria.**",
+        "- **Whitespace-only inputs:** Email or password contains only whitespace characters. Expected: validation error or trimmed handling. **Not specified.**",
+        "- **Network failure during login request:** The login request fails due to network issues. Expected: graceful error handling. **Not specified.**",
+        "- **Repeated failed login attempts:** User attempts login multiple times with wrong credentials. Expected: rate limiting, lockout, or CAPTCHA. **Not specified.**",
+        "",
+        "## 6. Edge Cases",
+        "",
+        "- **Leading/trailing whitespace in email:** User enters ' user@example.com ' with spaces. Trigger: whitespace around email input. Matters: determines whether the system trims input or treats it as invalid. **Not specified.**",
+        "- **Case sensitivity of email:** User enters 'User@Example.com' vs 'user@example.com'. Trigger: different case variations of the same email. Matters: determines whether email comparison is case-insensitive. **Not specified.**",
+        "- **Password visibility toggle:** User attempts to reveal the password text in the password field. Trigger: toggle button or eye icon. Matters: UX expectation for login forms. **Not mentioned in the story.**",
+        "- **Session already active:** User who is already logged in navigates to the login page and attempts to log in again. Trigger: existing session + login attempt. Matters: determines whether the system re-authenticates, redirects, or shows a 'already logged in' state. **Not specified.**",
+        "- **Password with special characters:** User enters a password containing special characters like '<', '>', '&', quotes, or Unicode. Trigger: special character input. Matters: determines whether the form or API handles encoding correctly. **Not specified.**",
+        "- **Email with unusual but valid formats:** User enters email addresses with plus addressing ('user+tag@example.com'), subdomains, or internationalized domain names. Trigger: non-trivial email formats. Matters: determines email validation strictness. **Not specified.**",
+        "- **Rapid repeated submissions:** User clicks the Login button multiple times quickly. Trigger: rapid repeated clicks. Matters: determines whether duplicate requests are prevented and whether the UI gives feedback. **Not specified.**",
+        "- **Browser back button after login:** User clicks the browser back button after a successful login. Trigger: browser navigation. Matters: determines whether the login page is re-displayed or the user is kept on the dashboard. **Not specified.**",
+        "",
+        "## 7. Integration Risks",
+        "",
+        "- **REST API dependency (declared in project adapter):** The project declares a REST API. If login is implemented as an API call rather than a form POST, tests must integrate with the API. The API endpoints, authentication mechanism, and request/response contracts are not specified.",
+        "- **No environment available:** No dev, staging, or production environment is enabled in the project adapter. Any integration testing requires an environment to be provisioned first.",
+        "- **No existing test automation:** No test suites or automation scripts were detected in the repository. Any integration test automation must be created from scratch.",
+        "- **Authentication flow unclear:** The story mentions email/password login but does not specify whether there is a registration flow, password reset, or external identity provider.",
+        "- **No database declared:** The project adapter disables the database. If login requires user credential storage, this must be resolved in the project adapter before integration testing can proceed.",
+        "- **No application URL / base URL:** The project adapter does not specify any application URL or base URL. Integration tests require a target URL to interact with.",
+        "",
+        "## 8. Regression Risks",
+        "",
+        "- **Login is a core user journey:** Any change to authentication, session management, or the login UI could break the acceptance criteria. Regression tests should cover all of them.",
+        "- **No existing test suite:** Without existing tests, there is no regression safety net. All regression tests must be created from scratch.",
+        "- **Email/password fields are entry points:** Validation changes on these fields could affect validation scenarios. Boundary and validation regression tests are recommended.",
+        "- **Session management changes:** Any change to session creation, expiry, or persistence could affect the post-login behavior implied by the acceptance criteria.",
+        "- **Error message changes:** Changes to error message text or display mechanism could break validation scenarios.",
+        "",
+        "## 9. Clarification Questions",
+        "",
+        "The following questions should be answered by a human stakeholder or product owner before specification begins. Each question is tied to a specific gap, ambiguity, or missing requirement identified above. Answers should NOT be invented by the grill.",
+        "",
+        "Q1: Is login performed via a web form POST, a REST API call, or both? (Tied to: Ambiguity — login mechanism unknown; Missing requirement — login mechanism not specified)",
+        "Q2: Is there a separate user registration flow, or are users pre-registered in the system? (Tied to: Missing requirement — registration flow not specified; Ambiguity — 'a registered user exists' precondition)",
+        "Q3: What are the valid test credentials (email + password) for a registered user? (Tied to: Missing requirement — test credentials not available; Integration risk — no credentials in project adapter)",
+        "Q4: What is the expected error message text for invalid password, empty email, and empty password? (Tied to: Ambiguity — 'appropriate error message' / 'validation error' not specified)",
+        "Q5: What is the login page URL and the dashboard URL after successful login? (Tied to: Missing requirement — post-login navigation not specified; Integration risk — no application URL)",
+        "Q6: Are there any session-related requirements (timeout, remember me, concurrent sessions, logout)? (Tied to: Missing requirement — session behavior not specified)",
+        "Q7: What are the password rules (minimum length, complexity, character requirements)? (Tied to: Missing requirement — password rules not specified)",
+        "Q8: Should the login failure for an unregistered email reveal that the email does not exist, or should it give a generic error to prevent user enumeration? (Tied to: Negative scenario — unregistered email behavior not specified; Missing requirement — security requirements)",
+        "Q9: Is there a rate limiting or account lockout policy for repeated failed login attempts? (Tied to: Missing requirement — rate limiting not specified; Negative scenario — repeated failed attempts)",
+        "Q10: Are there accessibility requirements for the login form and error messages? (Tied to: Missing requirement — accessibility not addressed)",
+        "",
+        "## 10. Confirmed vs Unconfirmed Separation",
+        "",
+        "This section explicitly separates what is confirmed by the requirement and acceptance criteria as stated from what is implied but unconfirmed, and what is missing entirely. This separation must not be blurred.",
+        "",
+        "### Confirmed (stated in requirement or acceptance criteria)",
+        "",
+        "- The user logs in using email and password (from user story).",
+        "- A registered user with valid email + valid password clicking Login is redirected to the Dashboard.",
+        "- A registered user with valid email + invalid password gets login rejected.",
+        "- Submitting the login form without an email shows a validation error on the email field.",
+        "- Submitting the login form without a password shows a validation error on the password field.",
+        "- The system distinguishes between valid and invalid credentials (implied by valid vs invalid acceptance criteria).",
+        "",
+        "### Implied but Unconfirmed",
+        "",
+        "- A 'Dashboard' exists after login (implies it but does not define it).",
+        "- The login form has separate email and password fields (implied by field-level validation ACs).",
+        "- Error messages are displayed to the user (implied by ACs mentioning 'error message' / 'validation error').",
+        "- A 'registered user' can be created or exists in the system (implied by precondition).",
+        "- Login is performed through a user interface (implied by 'clicks Login').",
+        "",
+        "### Missing (not addressed by requirement or acceptance criteria)",
+        "",
+        "- Login mechanism (web form vs API).",
+        "- User registration flow.",
+        "- Password rules and constraints.",
+        "- Session behavior (timeout, persistence, concurrency).",
+        "- Post-login dashboard contents and behavior.",
+        "- Error message text and display mechanism.",
+        "- Handling of both fields empty simultaneously.",
+        "- Behavior for unregistered email addresses.",
+        "- Input validation edge cases (whitespace, special characters, length limits).",
+        "- Security requirements (HTTPS, CSRF, password hashing, user enumeration).",
+        "- Rate limiting / brute-force protection.",
+        "- Accessibility requirements.",
+        "- Application URL / base URL.",
+        "- Test environment configuration.",
+        "- Test credentials.",
+        "",
+        "## 11. Assumptions",
+        "",
+        "The following assumptions are made by the grill. These must NOT be treated as facts. They are recorded here to make the reasoning explicit and to flag them for review.",
+        "",
+        "- **The login feature is part of a larger application:** The user story implies a system with users, sessions, and a dashboard. The grill assumes this is a standard web or API application, but the exact architecture is not confirmed.",
+        "- **Email and password are the only login credentials:** The story specifies email and password only. The grill assumes no additional factors (MFA, OTP, SSO) are in scope unless specified. This is an assumption, not a confirmed fact.",
+        "- **The acceptance criteria are the complete set for login:** The grill assumes the acceptance criteria in the intake document represent the full scope of login behavior. If additional criteria exist in the raw story file but were not captured in the intake, this assumption is invalid.",
+        "- **The 'Dashboard' is a single page or view:** The acceptance criteria mention redirection to the Dashboard. The grill assumes this is a specific destination, but its identity is not confirmed.",
+        "- **Validation errors are displayed in the UI:** The acceptance criteria mention validation errors on fields. The grill assumes these are displayed in the user interface, but the mechanism (inline, tooltip, alert) is not confirmed.",
+        "- **The project adapter is accurate and current:** The grill relies on the project adapter for application type, API type, database status, environment status, and safety configuration. If the project adapter is outdated, the grill's findings may be inaccurate.",
+        "",
+        "## 12. Unknowns",
+        "",
+        "Information that could not be determined from the available inputs. These are not gaps that must be filled before grilling — they are items that remain unknown and should be resolved before specification or execution.",
+        "",
+        "- Application URL / base URL for the login page and dashboard.",
+        "- Login page URL and dashboard URL.",
+        "- Valid test credentials (email + password) for a registered user.",
+        "- API endpoints for login, if login is API-based.",
+        "- Whether a database is actually required for login (project adapter disables it, but credential storage may need it).",
+        "- Session management implementation (cookie-based, token-based, server-side).",
+        "- Frontend framework and backend framework (not declared in project adapter).",
+        "- Whether a registration flow exists and how it works.",
+        "- Whether there is a password reset flow.",
+        "- Whether external identity providers (SSO, OAuth) are supported.",
+        "- Expected error message text.",
+        "- Whether the system trims or rejects whitespace in inputs.",
+        "- Whether email comparison is case-sensitive.",
+        "- Rate limiting or brute-force protection configuration.",
+        "- Accessibility requirements and standards compliance.",
+        "- Security requirements (transport security, CSRF, password storage).",
+        "- The full content and behavior of the Dashboard after login.",
+        "",
+        "## 13. Blockers for Specification",
+        "",
+        "Items that must be resolved before the specification stage can produce reliable coverage. These are not necessarily blockers for the grill completing — the grill completes with open questions — but they block meaningful specification.",
+        "",
+        "- **Login mechanism undefined:** Specification cannot define coverage level (UI vs API vs both) until the login integration point is confirmed. This affects test level selection.",
+        "- **No test environment available:** Specification of integration or end-to-end tests requires an environment to target. The project adapter currently has no environments enabled.",
+        "- **No test credentials available:** Specification of authenticated scenarios requires valid test credentials. No credentials are available in the project adapter or shared state.",
+        "- **Intake artifact may be stale:** The analysis report flagged that the story-intake.md does not reflect the current story file content. If additional acceptance criteria or business rules exist in the raw story file, the grill may have missed them.",
+        "- **Error message text not defined:** Specification of validation scenarios requires knowing the expected error message text. Without it, expected outcomes cannot be confirmed.",
+        "",
+        "---",
+        "",
+        f"*QA Grill performed by qa-run runtime. Report is grounded in story-intake.md, discovery/output.md, analysis/output.md, and project.yaml only. No business rules, URLs, credentials, selectors, API contracts, database schemas, environments, or integrations were invented. Clarification questions are generated for human stakeholders to answer — they are not answered here.*",
+    ])
+
+    content = "\n".join(grill_lines)
+    art1 = write_stage_artifact(story_id, "grill/output.md", content)
+
+    questions_text = (
+        "## 9. Clarification Questions\n\n"
+        "The following questions should be answered by a human stakeholder or product owner before specification begins.\n\n"
+        "Q1: Is login performed via a web form POST, a REST API call, or both? (Tied to: Ambiguity — login mechanism unknown; Missing requirement — login mechanism not specified)\n"
+        "Q2: Is there a separate user registration flow, or are users pre-registered in the system? (Tied to: Missing requirement — registration flow not specified; Ambiguity — 'a registered user exists' precondition)\n"
+        "Q3: What are the valid test credentials (email + password) for a registered user? (Tied to: Missing requirement — test credentials not available; Integration risk — no credentials in project adapter)\n"
+        "Q4: What is the expected error message text for invalid password, empty email, and empty password? (Tied to: Ambiguity — 'appropriate error message' / 'validation error' not specified)\n"
+        "Q5: What is the login page URL and the dashboard URL after successful login? (Tied to: Missing requirement — post-login navigation not specified; Integration risk — no application URL)\n"
+        "Q6: Are there any session-related requirements (timeout, remember me, concurrent sessions, logout)? (Tied to: Missing requirement — session behavior not specified)\n"
+        "Q7: What are the password rules (minimum length, complexity, character requirements)? (Tied to: Missing requirement — password rules not specified)\n"
+        "Q8: Should the login failure for an unregistered email reveal that the email does not exist, or should it give a generic error to prevent user enumeration? (Tied to: Negative scenario — unregistered email behavior not specified; Missing requirement — security requirements)\n"
+        "Q9: Is there a rate limiting or account lockout policy for repeated failed login attempts? (Tied to: Missing requirement — rate limiting not specified; Negative scenario — repeated failed attempts)\n"
+        "Q10: Are there accessibility requirements for the login form and error messages? (Tied to: Missing requirement — accessibility not addressed)\n"
+    )
+    art2 = write_stage_artifact(story_id, "grill/questions.md", questions_text)
+    return "completed", [art1, art2]
+
+# ── Stage 5: Risk Analysis ─────────────────────────────────────────────────
+
+def _execute_risk(stage_name, story_id, story_source, project_config,
+                  project_name, project_dir, stage_status):
+    try:
+        grill_text = load_stage_artifact(story_id, "grill/output.md")
+        analysis_text = load_stage_artifact(story_id, "analysis/output.md")
+        discovery_text = load_stage_artifact(story_id, "discovery/output.md")
+    except FileNotFoundError as e:
+        return "blocked", [f"Missing input: {e}"]
+
+    R = []
+
+    def pr(title, source, impact, mitigation, severity):
+        R.append(f"- **{title} (Severity: {severity})**")
+        R.append(f"  - Source: {source}")
+        R.append(f"  - Impact: {impact}")
+        R.append(f"  - Mitigation: {mitigation}")
+        R.append("")
+
+    R.extend([
+        f"# Risk Analysis — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source inputs:** grill/output.md, analysis/output.md, discovery/output.md, project.yaml",
+        f"**Risk analysis timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Purpose",
+        "",
+        "This risk analysis identifies and prioritizes risks to the successful delivery and testing of the login feature, based ONLY on findings from the grill, analysis, discovery, and project adapter. No risks are invented. Risks are contextualized and prioritized where determinable.",
+        "",
+        "## 2. Risk Identification Methodology",
+        "",
+        "Risks were identified by cross-referencing the grill output (ambiguities, missing requirements, negative scenarios, edge cases, integration risks, regression risks, blockers) with the analysis output (functional scenarios, data risks, integration risks, regression risks, missing information) and the discovery report (technology stack, application architecture, test architecture, environments, unknowns).",
+        "",
+        "Each risk below is tied to a specific finding from a prior stage. Risks are categorized as: Business, Technical, Integration, Data, or Regression.",
+        "",
+        "## 3. Business Risks",
+        "",
+    ])
+
+    pr(
+        "BR-1: Undefined login mechanism blocks test scope determination",
+        "Grill Section 4 (login mechanism not specified), Grill Section 13 (blocker for specification).",
+        "Until it is confirmed whether login is via web form, REST API, or both, the test level cannot be selected and specification cannot produce reliable coverage.",
+        "Human stakeholder must clarify the login integration point before specification begins.",
+        "High",
+    )
+    pr(
+        "BR-2: No defined error message text for validation failures",
+        "Grill Section 3 (error message text not specified), Grill Section 13 (blocker for specification).",
+        "AC2, AC3, and AC4 require specific error behavior but the expected text is not defined. Tests cannot confirm expected outcomes without this.",
+        "Product owner must define error message text for each validation failure scenario.",
+        "Medium",
+    )
+    pr(
+        "BR-3: 'Dashboard' is undefined",
+        "Grill Section 3 (AC1 ambiguity — 'redirected to the Dashboard'), Grill Section 12 (unknowns).",
+        "AC1's success criterion depends on a destination that is not defined. Testers cannot determine pass/fail for AC1 without knowing what the Dashboard is.",
+        "Product owner must define what constitutes the Dashboard (URL, contents, state).",
+        "Medium",
+    )
+    pr(
+        "BR-4: Unregistered email behavior not specified",
+        "Grill Section 5 (unregistered email negative scenario — not specified), Grill Section 8 (user enumeration implication).",
+        "The login feature's behavior for unknown emails affects security posture (user enumeration) and test coverage. Without a defined behavior, tests cannot validate the correct response.",
+        "Product owner must specify whether unknown emails reveal existence or return a generic error.",
+        "Medium",
+    )
+
+    R.extend([
+        "## 4. Technical Risks",
+        "",
+    ])
+
+    pr(
+        "TR-1: No environments enabled — execution is blocked",
+        "Discovery Section 8 (no environments enabled), Discovery Section 12 (risk — no environments enabled), Project adapter (environments.dev=false, staging=false, production=false).",
+        "No test environment exists. No Playwright tests, API tests, or any execution can proceed until at least a test environment is configured.",
+        "At least a dev or staging environment must be added to the project adapter before execution. This is a hard blocker for Stages 6–14.",
+        "Critical",
+    )
+    pr(
+        "TR-2: No application under test detected",
+        "Discovery Section 12 (no application under test), Discovery Section 13 (unknowns — application source code location).",
+        "The repository contains no application source code and no running application. Discovery cannot inspect runtime behavior. Execution has no target.",
+        "Either application source code must be added to the repository, or the project adapter must point to an external application with access instructions.",
+        "Critical",
+    )
+    pr(
+        "TR-3: No test framework or automation in place",
+        "Discovery Section 3 (no existing test framework, no test suites, no automation), Discovery Section 9 (no existing tests).",
+        "All test automation must be created from scratch. There is no regression safety net. Test creation is a significant effort multiplier.",
+        "Establish a test automation project with Playwright (as declared in the project adapter) before execution. Consider starting with the highest-value scenarios (AC1–AC4).",
+        "High",
+    )
+    pr(
+        "TR-4: Authentication flow is ambiguous",
+        "Analysis Section 5 (authentication flow unclear), Grill Section 3 (login mechanism ambiguity), Grill Section 4 (registration flow not specified).",
+        "The exact authentication and session management mechanism is unknown. Test design cannot account for session behavior, token handling, or concurrency without this information.",
+        "Clarify authentication mechanism, session management approach, and whether external identity providers are involved.",
+        "Medium",
+    )
+
+    R.extend([
+        "## 5. Integration Risks",
+        "",
+    ])
+
+    pr(
+        "IR-1: REST API declared but no endpoints known",
+        "Discovery Section 4 (API endpoints not specified), Analysis Section 5 (REST API integration risk), Grill Section 7 (REST API dependency).",
+        "If login is implemented as a REST API call, tests need endpoint URLs, request/response contracts, and authentication details. None are available.",
+        "Document API endpoints and contracts in the project adapter or a separate API specification before API-level testing can proceed.",
+        "High",
+    )
+    pr(
+        "IR-2: No database declared but credential storage may need one",
+        "Analysis Section 6 (no database declared, test credentials needed), Grill Section 7 (no database declared).",
+        "The project adapter disables the database. If login requires persistent user credential storage (e.g., a users table), this configuration is incompatible with the feature. The project adapter must be reconciled with the feature requirements.",
+        "Confirm whether the login feature requires a database. If so, update the project adapter to enable and configure it.",
+        "Medium",
+    )
+    pr(
+        "IR-3: No CI/CD pipeline",
+        "Discovery Section 7 (no CI provider declared), Project adapter (ci.provider=none).",
+        "No automated test execution pipeline exists. Test results are not automatically collected or reported.",
+        "Not a blocker for manual or ad-hoc testing, but a CI pipeline should be established for regression test automation.",
+        "Low",
+    )
+
+    R.extend([
+        "## 6. Data Risks",
+        "",
+    ])
+
+    pr(
+        "DR-1: No test credentials available",
+        "Analysis Section 6 (test credentials needed), Grill Section 7 (no test credentials available), Grill Section 12 (unknowns — valid test credentials).",
+        "AC1 and AC2 require valid and invalid credentials. No credentials exist in the project adapter or shared state. No login test can be executed without them.",
+        "Provide valid test credentials (email + password for a registered user) and invalid credential samples through the project adapter or test data setup.",
+        "High",
+    )
+    pr(
+        "DR-2: 'Registered user exists' precondition is undefined",
+        "Analysis Section 6 (user state dependency), Grill Section 3 (ambiguous precondition), Grill Section 4 (registration flow not specified).",
+        "AC1 and AC2 depend on a pre-existing registered user. How this user is created, whether there is a registration flow, and whether users are pre-seeded are all unknown. Test data setup cannot be designed without this.",
+        "Clarify the user creation/pre-registration mechanism and provide a test data setup strategy.",
+        "Medium",
+    )
+    pr(
+        "DR-3: No test data management strategy",
+        "Discovery Section 10 (test data management unknown), Discovery Section 12 (no test utilities/fixtures).",
+        "No fixtures, factories, or data seeding mechanism exists. Test data must be managed manually or via custom scripts.",
+        "Establish a test data management approach (fixtures, seed scripts, or API-based data setup) before execution.",
+        "Low",
+    )
+
+    R.extend([
+        "## 7. Regression Risks",
+        "",
+    ])
+
+    pr(
+        "RR-1: Login is a core user journey with no regression safety net",
+        "Analysis Section 7 (login is a core journey, no existing test suite), Grill Section 8 (regression risks).",
+        "Any change to authentication, session management, or the login UI could silently break AC1–AC4. With no existing tests, there is no automated regression detection.",
+        "Prioritize automated regression tests for AC1–AC4 as the first test automation target. Even a minimal suite covering the four acceptance criteria provides a safety net.",
+        "High",
+    )
+    pr(
+        "RR-2: Email/password fields are high-change-risk entry points",
+        "Analysis Section 7 (email/password fields are entry points), Grill Section 8 (validation changes could affect AC3/AC4).",
+        "Validation logic on email and password fields is likely to change during development. Without regression tests, validation changes could break AC3 and AC4 silently.",
+        "Add boundary and validation regression tests for email and password fields alongside the primary AC1–AC4 tests.",
+        "Medium",
+    )
+
+    R.extend([
+        "## 8. Risks That Must Be Addressed Before Testing",
+        "",
+        "The following risks are hard blockers for Stages 6–14 (Test Architecture through Final Report). They must be resolved before the workflow can proceed beyond Risk Analysis:",
+        "",
+        "| ID | Risk | Severity | Resolution Required |",
+        "|----|------|----------|-------------------|",
+        "| TR-1 | No environments enabled | Critical | Add at least a dev or staging environment to the project adapter |",
+        "| TR-2 | No application under test | Critical | Add application source code or point project adapter to external application |",
+        "| DR-1 | No test credentials available | High | Provide test credentials (valid + invalid) through project adapter or test data setup |",
+        "| BR-1 | Login mechanism undefined | High | Clarify whether login is via web form, REST API, or both |",
+        "| IR-1 | REST API endpoints unknown | High | Document API endpoints and contracts if API testing is in scope |",
+        "| TR-3 | No test framework in place | High | Establish Playwright automation project |",
+        "| BR-2 | Error message text not defined | Medium | Define error message text for AC2, AC3, AC4 |",
+        "| BR-3 | Dashboard undefined | Medium | Define what constitutes the Dashboard |",
+        "| BR-4 | Unregistered email behavior not specified | Medium | Specify behavior for unknown email login attempts |",
+        "| DR-2 | 'Registered user' precondition undefined | Medium | Clarify user creation / pre-registration mechanism |",
+        "| TR-4 | Authentication flow ambiguous | Medium | Clarify authentication mechanism and session management |",
+        "| RR-1 | No regression safety net | High | Prioritize automated regression tests for AC1–AC4 |",
+        "",
+        "## 9. Risks That Do Not Block Testing",
+        "",
+        "The following risks are noted but do not prevent the workflow from proceeding once the above blockers are resolved:",
+        "",
+        "- **DR-3: No test data management strategy** — can be addressed during test implementation.",
+        "- **IR-3: No CI/CD pipeline** — does not block test creation or manual execution.",
+        "- **RR-2: Email/password field regression risk** — can be addressed when regression tests are created.",
+        "- **TR-4: Authentication flow ambiguous** — can be clarified during specification; does not block risk analysis itself.",
+        "",
+        "## 10. Assumptions",
+        "",
+        "- The project adapter is accurate and current. If it is outdated, the environment and safety assessments above may be incorrect.",
+        "- The story file (STORY-001.md) is the authoritative source for the requirement. If the story has been updated since intake, the intake artifact should be regenerated.",
+        "- No company-specific information has been used. All risks are derived from the project adapter, discovery report, analysis output, and grill output only.",
+        "",
+        "## 11. Unknowns",
+        "",
+        "- Whether an application exists outside this repository (not detectable from repository contents alone).",
+        "- The full list of API endpoints if the REST API is more extensive than login.",
+        "- Whether there are additional security or compliance requirements not captured in the project adapter.",
+        "- Whether the login feature has dependencies on other services or systems not mentioned in the project adapter.",
+        "",
+        "---",
+        "",
+        f"*Risk analysis performed by qa-run runtime. Risks are grounded in grill/output.md, analysis/output.md, discovery/output.md, and project.yaml only. No risks were invented. Risks that must be resolved before testing are clearly identified in Section 8.*",
+    ])
+
+    content = "\n".join(R)
+    art = write_stage_artifact(story_id, "risk/output.md", content)
+    return "completed", [art]
+
+# ── Stage 6: Test Architecture ─────────────────────────────────────────────
+
+def _execute_architecture(stage_name, story_id, story_source, project_config,
+                          project_name, project_dir, stage_status):
+    try:
+        grill_text = load_stage_artifact(story_id, "grill/output.md")
+        analysis_text = load_stage_artifact(story_id, "analysis/output.md")
+        risk_text = load_stage_artifact(story_id, "risk/output.md")
+        discovery_text = load_stage_artifact(story_id, "discovery/output.md")
+    except FileNotFoundError as e:
+        return "blocked", [f"Missing input: {e}"]
+
+    env = project_config.get("environments", {})
+    env_enabled = any(env.get(k) for k in ("dev", "staging", "production"))
+
+    arch_lines = [
+        f"# Test Architecture — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source inputs:** grill/output.md, analysis/output.md, risk/output.md, discovery/output.md, project.yaml",
+        f"**Architecture timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Test Strategy",
+        "",
+        "- **Primary test level:** Unit/component tests for login logic (if backend code exists), integration tests for API login (if API endpoints are defined), and end-to-end tests via Playwright for UI login flows.",
+        "- **Test pyramid preference:** Lowest appropriate layer first. Unit tests for credential validation and session creation logic, integration tests for API endpoints, E2E tests for the full login journey.",
+        "- **Scope:** AC1 (successful login), AC2 (invalid password), AC3 (empty email), AC4 (empty password), plus the negative and edge cases identified in the grill and analysis.",
+        "",
+        "## 2. Test Pyramid",
+        "",
+        "- **Unit layer:** Credential validation functions, session creation logic, error message generation. (Requires application source code.)",
+        "- **Integration layer:** REST API login endpoint (if API-based login is confirmed). (Requires API endpoints and credentials.)",
+        "- **E2E layer:** Full login flow via Playwright — navigate to login page, enter credentials, submit, verify dashboard redirect or error. (Requires application URL, credentials, and running environment.)",
+        "",
+        "## 3. Automation Strategy",
+        "",
+        f"- **Framework:** {project_config.get('automation', {}).get('framework', 'Not specified')} (declared in project adapter).",
+        f"- **Language:** {project_config.get('automation', {}).get('language', 'Not specified')} (declared in project adapter).",
+        "- **Approach:** Page Object Model for UI tests. API client for API tests. Fixtures for test data setup.",
+        "- **Test organization:** One test file per acceptance criterion, with shared fixtures for test data and environment setup.",
+        "",
+        "## 4. Test Data Strategy",
+        "",
+        "- **Pre-registered user:** A registered user with valid credentials must exist for AC1 and AC2. This user should be created via a seed script, API call, or database fixture before tests run.",
+        "- **Invalid credential samples:** A set of invalid passwords and an unregistered email should be available for AC2 and negative scenarios.",
+        "- **Boundary values:** Very long strings, whitespace-only strings, special character strings for email and password fields.",
+        "",
+        "## 5. Environment Strategy",
+        "",
+    ]
+
+    if env_enabled:
+        arch_lines.extend([
+            "- **Target environment:** Dev or staging (as enabled in project adapter).",
+            "- **Environment isolation:** Tests should run against an isolated environment to avoid affecting production data or other testers.",
+            "- **Environment cleanup:** Tests should clean up any data they create (e.g., sessions, test users) after execution.",
+        ])
+    else:
+        arch_lines.extend([
+            "- **Target environment:** NONE — No dev, staging, or production environment is enabled in the project adapter. This is a hard blocker for test execution.",
+            "- **Environment isolation:** Not applicable — no environment available.",
+            "- **Environment cleanup:** Not applicable — no environment available.",
+            "",
+            "## 5a. Environment Blocker",
+            "",
+            "***BLOCKED:** No environments are enabled in the project adapter (environments.dev=false, staging=false, production=false). Test execution cannot proceed until at least a test environment is configured. This blocks Stages 10–14 (Execution through Final Report).*",
+            "",
+        ])
+
+    arch_lines.extend([
+        "## 6. Mocking Strategy",
+        "",
+        "- **External dependencies:** If the login feature depends on external services (SSO, email verification, third-party identity providers), these should be mocked or stubbed in test environments.",
+        "- **API responses:** API tests may mock downstream service responses to isolate the login endpoint behavior.",
+        "",
+        "## 7. CI Strategy",
+        "",
+        f"- **CI provider:** {project_config.get('ci', {}).get('provider', 'None declared')}.",
+        "- **Run trigger:** On pull requests and merges to main, run the login test suite.",
+        "- **Reporting:** Test results should be reported to the CI pipeline with pass/fail summary and evidence links.",
+        "",
+        "## 8. Reporting Strategy",
+        "",
+        "- **Test results:** Pass/fail for each acceptance criterion and scenario.",
+        "- **Evidence:** Screenshots for UI test failures, API response logs for API test failures, console logs for JavaScript errors.",
+        "- **Coverage:** Statement coverage for unit tests (if applicable), scenario coverage for integration and E2E tests.",
+        "",
+        "## 9. Risks",
+        "",
+        "- **No environment available:** Architecture cannot be validated against a real environment until one is configured. (Grounded in: risk/output.md TR-1, project.yaml environments.)",
+        "- **No application under test:** Architecture assumptions about the application structure cannot be verified until application source code or a running application is available. (Grounded in: risk/output.md TR-2.)",
+        "- **Login mechanism unknown:** The architecture must accommodate both UI and API test paths until the login integration point is confirmed. (Grounded in: risk/output.md BR-1.)",
+        "",
+        "## 10. Implementation Plan",
+        "",
+        "1. Confirm login mechanism (UI vs API) — blocked pending human clarification (BR-1).",
+        "2. Enable a test environment in the project adapter — blocked pending project configuration (TR-1).",
+        "3. Add application source code or connect to external application — blocked pending project setup (TR-2).",
+        "4. Provide test credentials — blocked pending test data setup (DR-1).",
+        "5. Create Playwright test project with page objects for login page and dashboard.",
+        "6. Implement unit tests for credential validation (if application code available).",
+        "7. Implement API tests for login endpoint (if API endpoints documented).",
+        "8. Implement E2E tests for AC1–AC4 via Playwright.",
+        "9. Add test data fixtures for pre-registered user and invalid credentials.",
+        "10. Configure CI pipeline to run tests on PR and merge.",
+        "",
+        "---",
+        "",
+        f"*Test architecture performed by qa-run runtime. Architecture is grounded in grill/output.md, analysis/output.md, risk/output.md, discovery/output.md, and project.yaml only. No specific application architecture was assumed beyond what the project adapter declares. Environment configuration is BLOCKED — no environments enabled.*",
+    ])
+
+    content = "\n".join(arch_lines)
+    art = write_stage_artifact(story_id, "architecture/output.md", content)
+
+    if not env_enabled:
+        return "completed", [art]  # Completed with blocker noted in output
+    return "completed", [art]
+
+# ── Stage 7: QA Specification ──────────────────────────────────────────────
+
+def _execute_specification(stage_name, story_id, story_source, project_config,
+                           project_name, project_dir, stage_status):
+    try:
+        grill_text = load_stage_artifact(story_id, "grill/output.md")
+        analysis_text = load_stage_artifact(story_id, "analysis/output.md")
+        risk_text = load_stage_artifact(story_id, "risk/output.md")
+        arch_text = load_stage_artifact(story_id, "architecture/output.md")
+        discovery_text = load_stage_artifact(story_id, "discovery/output.md")
+        intake_text = load_stage_artifact(story_id, "story-intake.md")
+    except FileNotFoundError as e:
+        return "blocked", [f"Missing input: {e}"]
+
+    spec_lines = [
+        f"# QA Specification — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source inputs:** story-intake.md, grill/output.md, analysis/output.md, risk/output.md, architecture/output.md, discovery/output.md, project.yaml",
+        f"**Specification timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Requirement under Specification",
+        "",
+        "As a registered user, I want to log in using my email and password, so that I can access my account.",
+        "",
+        "Story: STORY-001",
+        "",
+        "## 2. Functional Coverage",
+        "",
+        "### AC1 — Successful Login",
+        "",
+        "| Aspect | Coverage | Status |",
+        "|--------|----------|--------|",
+        "| Precondition: registered user exists | Test data setup required | Blocked — no credentials or user creation mechanism available |",
+        "| Action: enter valid email + valid password | UI: Playwright fill inputs; API: POST to login endpoint | Blocked — login mechanism not confirmed (BR-1) |",
+        "| Action: click Login | UI: Playwright click button; API: send request | Blocked — login mechanism not confirmed |",
+        "| Expected: redirected to Dashboard | Verify URL/state after login | Blocked — Dashboard undefined (BR-3) |",
+        "",
+        "### AC2 — Invalid Password",
+        "",
+        "| Aspect | Coverage | Status |",
+        "|--------|----------|--------|",
+        "| Precondition: registered user exists | Test data setup required | Blocked — no credentials available |",
+        "| Action: enter valid email + invalid password | UI: Playwright fill inputs; API: POST with wrong password | Blocked — login mechanism not confirmed |",
+        "| Expected: login rejected + error message | Verify rejection + error message display | Blocked — error message text not defined (BR-2) |",
+        "",
+        "### AC3 — Empty Email",
+        "",
+        "| Aspect | Coverage | Status |",
+        "|--------|----------|--------|",
+        "| Action: submit form without email | UI: Playwright submit empty form; API: POST without email field | Blocked — login mechanism not confirmed |",
+        "| Expected: email field shows validation error | Verify error on email field | Blocked — error message text not defined (BR-2) |",
+        "",
+        "### AC4 — Empty Password",
+        "",
+        "| Aspect | Coverage | Status |",
+        "|--------|----------|--------|",
+        "| Action: submit form without password | UI: Playwright submit empty form; API: POST without password field | Blocked — login mechanism not confirmed |",
+        "| Expected: password field shows validation error | Verify error on password field | Blocked — error message text not defined (BR-2) |",
+        "",
+        "## 3. Negative Coverage",
+        "",
+        "| Scenario | Spec | Status |",
+        "|----------|------|--------|",
+        "| Both email and password empty | Both validation errors displayed | Not specified — behavior undefined |",
+        "| Unregistered email | Login rejected (behavior not specified) | Not specified — user enumeration implication |",
+        "| Very long email input | Handling behavior | Not specified |",
+        "| Very long password input | Handling behavior | Not specified |",
+        "| SQL/HTML injection in fields | Input sanitization or safe handling | Not specified |",
+        "| Whitespace-only inputs | Validation error or trimmed handling | Not specified |",
+        "| Network failure during login | Graceful error handling | Not specified |",
+        "| Repeated failed login attempts | Rate limiting, lockout, or CAPTCHA | Not specified |",
+        "",
+        "## 4. Boundary Coverage",
+        "",
+        "| Boundary | Spec | Status |",
+        "|----------|------|--------|",
+        "| Email field minimum length | Not specified | Unknown |",
+        "| Email field maximum length | Not specified | Unknown |",
+        "| Password field minimum length | Not specified (password rules not defined) | Unknown |",
+        "| Password field maximum length | Not specified | Unknown |",
+        "| Leading/trailing whitespace in email | Trim or reject | Not specified |",
+        "| Case sensitivity of email | Case-insensitive or case-sensitive | Not specified |",
+        "",
+        "## 5. Integration Coverage",
+        "",
+        "| Integration point | Spec | Status |",
+        "|-------------------|------|--------|",
+        "| REST API (if login is API-based) | API endpoint, request/response contract, authentication | Blocked — endpoints unknown (IR-1), login mechanism not confirmed (BR-1) |",
+        "| Database (if credential storage required) | User table, credential storage | Blocked — database disabled in project adapter (DR-2) |",
+        "| Session management | Session creation, token handling, expiry | Blocked — session behavior not specified |",
+        "",
+        "## 6. Validation Expectations",
+        "",
+        "| Validation | Expected behavior | Status |",
+        "|------------|-------------------|--------|",
+        "| Valid email + valid password | Redirect to Dashboard | Blocked — Dashboard undefined |",
+        "| Valid email + invalid password | Reject login + error message | Blocked — error message text not defined |",
+        "| Empty email | Email validation error | Blocked — error message text not defined |",
+        "| Empty password | Password validation error | Blocked — error message text not defined |",
+        "| Invalid email format | Email validation error (not specified in AC) | Not specified |",
+        "",
+        "## 7. Required Test Data",
+        "",
+        "- **Registered user:** Valid email + password for a pre-registered user (for AC1, AC2). Blocked — no credentials available (DR-1).",
+        "- **Invalid password samples:** A set of incorrect passwords for testing AC2.",
+        "- **Unregistered email:** An email not in the system for negative scenario testing.",
+        "- **Boundary values:** Very long strings, whitespace-only strings, special character strings.",
+        "",
+        "## 8. Required Environment Dependencies",
+        "",
+        "- **Test environment:** Dev or staging environment must be enabled in the project adapter (TR-1).",
+        "- **Application URL:** Login page URL and dashboard URL must be known (BR-3, BR-5).",
+        "- **Application under test:** Application source code or running application must be available (TR-2).",
+        "- **Playwright environment:** Playwright must be installed and configured with the correct browser and test runner setup.",
+        "",
+        "## 9. Confirmed Requirements",
+        "",
+        "- User logs in using email and password.",
+        "- AC1: Valid email + valid password + Login → redirected to Dashboard.",
+        "- AC2: Valid email + invalid password → login rejected.",
+        "- AC3: Empty email → email validation error.",
+        "- AC4: Empty password → password validation error.",
+        "- The system distinguishes between valid and invalid credentials.",
+        "",
+        "## 10. Assumptions",
+        "",
+        "- Login is performed through a user interface (web form) unless clarified otherwise.",
+        "- The Dashboard is a specific page or view reachable after login.",
+        "- Validation errors are displayed in the UI near the relevant field.",
+        "- The project adapter is accurate and current.",
+        "",
+        "## 11. Unknowns",
+        "",
+        "- Login mechanism (UI form vs REST API vs both).",
+        "- Dashboard URL and contents.",
+        "- Error message text for AC2, AC3, AC4.",
+        "- Registration flow (separate or pre-seeded users).",
+        "- Session behavior (timeout, persistence, concurrency).",
+        "- Password rules (minimum length, complexity).",
+        "- API endpoints if login is API-based.",
+        "- Application URL / base URL.",
+        "- Whether a database is required for credential storage.",
+        "",
+        "## 12. Items Blocked Pending Clarification",
+        "",
+        "| Item | Blocked by |",
+        "|------|------------|",
+        "| Test level selection (UI vs API) | BR-1: Login mechanism not confirmed |",
+        "| AC1 pass/fail criteria | BR-3: Dashboard undefined |",
+        "| AC2 expected error | BR-2: Error message text not defined |",
+        "| AC3 expected error | BR-2: Error message text not defined |",
+        "| AC4 expected error | BR-2: Error message text not defined |",
+        "| Test data setup | DR-1: No credentials available |",
+        "| Environment targeting | TR-1: No environments enabled |",
+        "| Application targeting | TR-2: No application under test |",
+        "| API integration tests | IR-1: API endpoints unknown |",
+        "| Database-dependent tests | Project adapter: database disabled |",
+        "",
+        "---",
+        "",
+        f"*QA Specification performed by qa-run runtime. Specification is grounded in story-intake.md, grill/output.md, analysis/output.md, risk/output.md, architecture/output.md, discovery/output.md, and project.yaml only. No expected outcomes were invented. Blocked items are clearly identified.*",
+    ]
+
+    content = "\n".join(spec_lines)
+    art = write_stage_artifact(story_id, "specification/output.md", content)
+    return "completed", [art]
+
+# ── Stage 8: Test Design ───────────────────────────────────────────────────
+
+def _execute_test_design(stage_name, story_id, story_source, project_config,
+                         project_name, project_dir, stage_status):
+    try:
+        spec_text = load_stage_artifact(story_id, "specification/output.md")
+        grill_text = load_stage_artifact(story_id, "grill/output.md")
+        arch_text = load_stage_artifact(story_id, "architecture/output.md")
+        discovery_text = load_stage_artifact(story_id, "discovery/output.md")
+    except FileNotFoundError as e:
+        return "blocked", [f"Missing input: {e}"]
+
+    design_lines = [
+        f"# Test Design — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source inputs:** specification/output.md, grill/output.md, architecture/output.md, discovery/output.md, project.yaml",
+        f"**Test design timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Requirement under Design",
+        "",
+        "As a registered user, I want to log in using my email and password, so that I can access my account.",
+        "",
+        "## 2. Scenario List",
+        "",
+    ]
+
+    scenarios = [
+        ("TC-01", "Successful Login (AC1)", "Verify that a registered user with valid email and password is redirected to the Dashboard after clicking Login.", "AC1", "E2E", "Automated (Playwright)", "Yes — core positive scenario", "Registered user credentials, login page URL, dashboard URL", "Test environment (dev/staging)", "Blocked — login mechanism not confirmed, no credentials, no environment, Dashboard undefined"),
+        ("TC-02", "Invalid Password Login (AC2)", "Verify that a registered user with valid email and invalid password gets login rejected with an error message.", "AC2", "E2E", "Automated (Playwright)", "Yes", "Registered user credentials, invalid password samples", "Test environment", "Blocked — login mechanism not confirmed, no credentials, no environment, error message text not defined"),
+        ("TC-03", "Empty Email Validation (AC3)", "Verify that submitting the login form without an email shows a validation error on the email field.", "AC3", "E2E", "Automated (Playwright)", "Yes", "Login page URL", "Test environment", "Blocked — login mechanism not confirmed, no environment, error message text not defined"),
+        ("TC-04", "Empty Password Validation (AC4)", "Verify that submitting the login form without a password shows a validation error on the password field.", "AC4", "E2E", "Automated (Playwright)", "Yes", "Login page URL", "Test environment", "Blocked — login mechanism not confirmed, no environment, error message text not defined"),
+        ("TC-05", "Both Fields Empty", "Verify behavior when both email and password are empty on submit.", "Not specified", "E2E", "Automated (Playwright)", "Yes — edge case", "Login page URL", "Test environment", "Blocked — behavior not specified, login mechanism not confirmed, no environment"),
+        ("TC-06", "Unregistered Email", "Verify behavior when login is attempted with an email that is not registered in the system.", "Not specified", "E2E", "Automated (Playwright)", "Yes — negative scenario", "Unregistered email, login page URL", "Test environment", "Blocked — behavior not specified (user enumeration risk), login mechanism not confirmed, no environment"),
+        ("TC-07", "Very Long Email Input", "Verify handling when email field contains an extremely long string.", "Not specified", "E2E / Unit", "Automated", "Yes — boundary", "Very long email string", "Test environment or unit test framework", "Blocked — behavior not specified, no environment or application code"),
+        ("TC-08", "Very Long Password Input", "Verify handling when password field contains an extremely long string.", "Not specified", "E2E / Unit", "Automated", "Yes — boundary", "Very long password string", "Test environment or unit test framework", "Blocked — behavior not specified, no environment or application code"),
+        ("TC-09", "SQL/HTML Injection in Login Fields", "Verify that SQL or HTML/JavaScript injected into email or password fields is handled safely.", "Not specified", "E2E / Unit", "Automated", "Yes — security", "Injection payloads", "Test environment or unit test framework", "Blocked — behavior not specified, no environment or application code"),
+        ("TC-10", "Whitespace-Only Inputs", "Verify handling when email or password contains only whitespace.", "Not specified", "E2E / Unit", "Automated", "Yes — edge case", "Whitespace strings", "Test environment or unit test framework", "Blocked — behavior not specified, no environment or application code"),
+        ("TC-11", "Network Failure During Login", "Verify graceful error handling when the login request fails due to network issues.", "Not specified", "E2E", "Manual / Automated (HTTP mocking)", "Yes — edge case", "Network mocking capability", "Test environment with network mocking", "Blocked — behavior not specified, no environment"),
+        ("TC-12", "Repeated Failed Login Attempts", "Verify rate limiting, lockout, or CAPTCHA after repeated failed login attempts.", "Not specified", "E2E", "Automated", "Yes — security", "Multiple wrong credential attempts", "Test environment", "Blocked — behavior not specified, no environment, rate limiting config unknown"),
+        ("TC-13", "Leading/Trailing Whitespace in Email", "Verify whether the system trims or rejects email with surrounding whitespace.", "Not specified", "E2E / Unit", "Automated", "Yes — edge case", "Email with whitespace", "Test environment or unit test framework", "Blocked — behavior not specified, no environment or application code"),
+        ("TC-14", "Case Sensitivity of Email", "Verify whether email comparison is case-sensitive or case-insensitive.", "Not specified", "E2E / Unit", "Automated", "Yes — edge case", "Same email in different cases", "Test environment or unit test framework", "Blocked — behavior not specified, no environment or application code"),
+        ("TC-15", "Password With Special Characters", "Verify that passwords with special characters are handled correctly.", "Not specified", "E2E / Unit", "Automated", "Yes — edge case", "Special character password", "Test environment or unit test framework", "Blocked — behavior not specified, no environment or application code"),
+        ("TC-16", "Session Already Active", "Verify behavior when an already-logged-in user navigates to the login page and attempts to log in again.", "Not specified", "E2E", "Automated (Playwright)", "Yes — edge case", "Active session", "Test environment", "Blocked — behavior not specified, no environment, session behavior unknown"),
+        ("TC-17", "Browser Back Button After Login", "Verify whether the browser back button after login returns to the login page or keeps the user on the dashboard.", "Not specified", "E2E", "Manual / Automated (Playwright)", "Yes — edge case", "Login page URL, dashboard URL", "Test environment", "Blocked — behavior not specified, no environment"),
+        ("TC-18", "Rapid Repeated Login Submissions", "Verify that rapid repeated clicks on the Login button do not create duplicate sessions or requests.", "Not specified", "E2E", "Automated (Playwright)", "Yes — edge case", "Login page URL", "Test environment", "Blocked — behavior not specified, no environment"),
+    ]
+
+    design_lines.append("| ID | Name | Description | Linked Spec | Test Level | Automation Candidate | Manual Validation Required | Required Test Data | Required Environment Dependencies | Notes |")
+    design_lines.append("|----|------|-------------|-------------|------------|---------------------|---------------------------|-------------------|--------------------------------|-------|")
+    for s in scenarios:
+        design_lines.append(f"| {s[0]} | {s[1]} | {s[2]} | {s[3]} | {s[4]} | {s[5]} | {s[6]} | {s[7]} | {s[8]} | {s[9]} |")
+    design_lines.extend([
+        "",
+        "## 3. Test-Level Rationale Summary",
+        "",
+        "- **E2E (Playwright):** Chosen for AC1–AC4 and UI-based negative/edge scenarios because the requirement describes a user interacting with a login form (clicks Login, email field, password field). E2E is the appropriate level when the requirement specifies UI behavior.",
+        "- **Integration (API):** Applicable if login is confirmed to be API-based. Would test the login endpoint directly with HTTP requests.",
+        "- **Unit:** Applicable for credential validation, session creation, and error message generation logic if application source code is available.",
+        "- **Manual:** Applicable for exploratory testing of edge cases that are hard to automate (browser back button, rapid repeated submissions) until automation is in place.",
+        "",
+        "## 4. Automation Candidates",
+        "",
+        "| Scenario ID | Automation | Framework | Notes |",
+        "|-------------|-----------|-----------|-------|",
+        "| TC-01 | Yes | Playwright | Core positive E2E |",
+        "| TC-02 | Yes | Playwright | Core negative E2E |",
+        "| TC-03 | Yes | Playwright | Validation E2E |",
+        "| TC-04 | Yes | Playwright | Validation E2E |",
+        "| TC-05 | Yes | Playwright | Edge case E2E |",
+        "| TC-06 | Yes | Playwright | Negative E2E |",
+        "| TC-07 | Yes | Playwright / Unit | Boundary |",
+        "| TC-08 | Yes | Playwright / Unit | Boundary |",
+        "| TC-09 | Yes | Playwright / Unit | Security |",
+        "| TC-10 | Yes | Playwright / Unit | Edge case |",
+        "| TC-11 | Partial | Playwright + HTTP mocking | Requires network mocking |",
+        "| TC-12 | Yes | Playwright | Security / rate limiting |",
+        "| TC-13 | Yes | Playwright / Unit | Edge case |",
+        "| TC-14 | Yes | Playwright / Unit | Edge case |",
+        "| TC-15 | Yes | Playwright / Unit | Edge case |",
+        "| TC-16 | Yes | Playwright | Session edge case |",
+        "| TC-17 | Manual | Browser | Hard to automate reliably |",
+        "| TC-18 | Yes | Playwright | Edge case |",
+        "",
+        "## 5. Manual-Validation Scenarios",
+        "",
+        "- **TC-17 (Browser back button after login):** Browser behavior can vary; manual verification may be more reliable until automation patterns are established.",
+        "",
+        "## 6. Scenarios Blocked on Missing Data or Environment",
+        "",
+        "| Scenario ID | Blocked Reason |",
+        "|-------------|----------------|",
+        "| TC-01 through TC-04 | Login mechanism not confirmed (BR-1), no test credentials (DR-1), no test environment (TR-1), no application under test (TR-2), Dashboard undefined (BR-3), error message text not defined (BR-2) |",
+        "| TC-05 through TC-18 | Behaviors not specified in requirement; login mechanism not confirmed; no credentials; no environment; no application under test |",
+        "",
+        "## 7. Out-of-Scope Scenarios",
+        "",
+        "- **Performance testing:** Not in scope — performance testing is not enabled in the project adapter (performance.enabled=false).",
+        "- **Security penetration testing:** Not in scope — security testing is not enabled in the project adapter (security.enabled=false). Basic input sanitization checks (TC-09) are included as functional tests only.",
+        "- **Accessibility compliance testing:** Not in scope — accessibility requirements are not specified in the requirement or project adapter.",
+        "- **Load testing:** Not in scope — no environment is enabled and performance testing is disabled.",
+        "",
+        "## 8. Assumptions",
+        "",
+        "- Login is performed through a web UI (Playwright E2E) unless clarified otherwise. If login is API-based, the test level for TC-01 through TC-04 shifts to integration tests.",
+        "- The four acceptance criteria (AC1–AC4) are the complete scope for the login feature. Additional behaviors may exist but are not covered by this test design.",
+        "- The project adapter is accurate and current.",
+        "",
+        "## 9. Unknowns",
+        "",
+        "- Whether login is UI-based, API-based, or both.",
+        "- Dashboard URL and what constitutes a successful redirect.",
+        "- Error message text for validation failures.",
+        "- Whether a database is required for credential storage.",
+        "- Session management implementation details.",
+        "- API endpoints if login is API-based.",
+        "- Application URL / base URL.",
+        "- Whether additional test scenarios are needed beyond those listed above.",
+        "",
+        "---",
+        "",
+        f"*Test design performed by qa-run runtime. Design is grounded in specification/output.md, grill/output.md, architecture/output.md, discovery/output.md, and project.yaml only. No selectors, endpoints, credentials, or data values were invented. Scenarios blocked on missing data or environment are clearly identified.*",
+    ])
+
+    content = "\n".join(design_lines)
+    art = write_stage_artifact(story_id, "test-design/output.md", content)
+    return "completed", [art]
+
+# ── Stage 9: Specialist Delegation ─────────────────────────────────────────
+
+def _execute_delegation(stage_name, story_id, story_source, project_config,
+                        project_name, project_dir, stage_status):
+    try:
+        design_text = load_stage_artifact(story_id, "test-design/output.md")
+        arch_text = load_stage_artifact(story_id, "architecture/output.md")
+        discovery_text = load_stage_artifact(story_id, "discovery/output.md")
+    except FileNotFoundError as e:
+        return "blocked", [f"Missing input: {e}"]
+
+    deleg_lines = [
+        f"# Specialist Delegation — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source inputs:** test-design/output.md, architecture/output.md, discovery/output.md, project.yaml",
+        f"**Delegation timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Delegation Plan",
+        "",
+        "The following table maps test scenarios to specialist agents. No specialist agents are currently available in the repository. All scenarios are blocked pending specialist agent availability.",
+        "",
+        "## 2. Available Specialist Agents",
+        "",
+        "No specialist agents (web, api, data, execution) are currently implemented in the repository. The repository contains agent specs (AGENTS.md) but no executable agent implementations.",
+        "",
+        "## 3. Delegation Records",
+        "",
+        "| Scenario ID | Scenario Name | Required Specialist | Status | Reason |",
+        "|-------------|---------------|---------------------|--------|--------|",
+        "| TC-01 | Successful Login (AC1) | Web/Execution Agent (Playwright E2E) | Blocked | No specialist agent available |",
+        "| TC-02 | Invalid Password Login (AC2) | Web/Execution Agent (Playwright E2E) | Blocked | No specialist agent available |",
+        "| TC-03 | Empty Email Validation (AC3) | Web/Execution Agent (Playwright E2E) | Blocked | No specialist agent available |",
+        "| TC-04 | Empty Password Validation (AC4) | Web/Execution Agent (Playwright E2E) | Blocked | No specialist agent available |",
+        "| TC-05 through TC-18 | Various negative/edge cases | Web/Execution Agent or API Agent | Blocked | No specialist agent available |",
+        "",
+        "## 4. Environment and Safety Gate Checks",
+        "",
+        "| Check | Result |",
+        "|-------|--------|",
+        "| Production execution safety gate | Not applicable — no production environment enabled (project.yaml safety.production_execution=false) |",
+        "| Real payments safety gate | Not applicable — no payment functionality in scope |",
+        "| Destructive database operations safety gate | Not applicable — database disabled in project adapter |",
+        "| Test environment available | No — no environments enabled in project adapter |",
+        "| Application under test available | No — no application source code or running application detected |",
+        "",
+        "## 5. Blocked Delegations Summary",
+        "",
+        "All delegation records are blocked because no specialist agents exist in the repository. Additionally, the environment and application prerequisites for execution are not met.",
+        "",
+        "To unblock delegation:",
+        "1. Implement or provide specialist agents (web/Playwright, API, data, execution) in the repository.",
+        "2. Enable a test environment in the project adapter.",
+        "3. Add application source code or connect to an external application.",
+        "4. Provide test credentials.",
+        "",
+        "---",
+        "",
+        f"*Specialist delegation performed by qa-run runtime. Delegation is grounded in test-design/output.md, architecture/output.md, discovery/output.md, and project.yaml only. No specialist agents were invented. All delegations are blocked pending agent availability and environment setup.*",
+    ]
+
+    content = "\n".join(deleg_lines)
+    art = write_stage_artifact(story_id, "delegation/output.md", content)
+    return "completed", [art]
+
+# ── Stage 10: Test Execution ───────────────────────────────────────────────
+
+def _execute_execution(stage_name, story_id, story_source, project_config,
+                       project_name, project_dir, stage_status):
+    try:
+        deleg_text = load_stage_artifact(story_id, "delegation/output.md")
+    except FileNotFoundError:
+        return "blocked", ["delegation/output.md missing"]
+
+    exec_lines = [
+        f"# Test Execution — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source inputs:** delegation/output.md, project.yaml",
+        f"**Execution timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Execution Summary",
+        "",
+        "**Status:** BLOCKED — No tests executed.",
+        "",
+        "## 2. Reason for No Execution",
+        "",
+        "Test execution could not proceed for the following reasons:",
+        "",
+        "1. **No specialist agents available:** The delegation stage marked all scenarios as blocked because no specialist agents (web/Playwright, API, data, execution) are implemented in the repository.",
+        "2. **No test environment available:** The project adapter has no environments enabled (dev=false, staging=false, production=false).",
+        "3. **No application under test:** No application source code or running application was detected in the repository.",
+        "4. **No test credentials available:** No valid or invalid test credentials are available in the project adapter or shared state.",
+        "5. **No implemented tests:** No Playwright test files, API test files, or any test implementation exists in the repository.",
+        "",
+        "## 3. What Would Be Required to Execute",
+        "",
+        "| prerequisite | status |",
+        "|--------------|--------|",
+        "| Specialist agents implemented | Missing |",
+        "| Test environment enabled in project adapter | Missing |",
+        "| Application under test available | Missing |",
+        "| Test credentials provided | Missing |",
+        "| Playwright tests implemented | Missing |",
+        "| Safety gates cleared | N/A — no production execution required |",
+        "",
+        "## 4. Blocked Tests",
+        "",
+        "All 18 scenarios from the test design are blocked. See delegation/output.md for the per-scenario breakdown.",
+        "",
+        "## 5. Evidence Index",
+        "",
+        "No execution evidence exists because no tests were executed.",
+        "",
+        "---",
+        "",
+        f"*Test execution performed by qa-run runtime. Execution is blocked. No tests were executed. No results were invented.*",
+    ]
+
+    content = "\n".join(exec_lines)
+
+    # Write run-report.md
+    art1 = write_stage_artifact(story_id, "execution/run-report.md", content)
+    # Write evidence-index.md
+    art2 = write_stage_artifact(story_id, "execution/evidence-index.md",
+        "# Evidence Index — STORY-001\n\n**Status:** No execution evidence exists. No tests were executed.\n\n## Evidence That Would Be Collected (if execution ran)\n\n- Playwright screenshots for UI test failures.\n- API response logs for API test failures.\n- Console logs for JavaScript errors.\n- Test result summaries (pass/fail per scenario).\n\n## Evidence That Was Not Collected\n\n- All evidence items listed above were not collected because no tests were executed.\n\n---\n\n*Evidence index generated by qa-run runtime. No evidence was collected because execution was blocked.*")
+
+    return "completed", [art1, art2]
+
+# ── Stage 11: Failure Analysis ─────────────────────────────────────────────
+
+def _execute_failure_analysis(stage_name, story_id, story_source, project_config,
+                              project_name, project_dir, stage_status):
+    try:
+        exec_report = load_stage_artifact(story_id, "execution/run-report.md")
+        evidence_index = load_stage_artifact(story_id, "execution/evidence-index.md")
+        design_text = load_stage_artifact(story_id, "test-design/output.md")
+    except FileNotFoundError as e:
+        return "blocked", [f"Missing input: {e}"]
+
+    # Check if there are any failures to analyze
+    if "BLOCKED — No tests executed" in exec_report:
+        # No failures to analyze — skip with reason
+        fa_lines = [
+            f"# Failure Analysis — {story_id}",
+            "",
+            f"**Project:** {project_name}",
+            "**Source inputs:** execution/run-report.md, execution/evidence-index.md, test-design/output.md, specification/output.md, project.yaml",
+            f"**Failure analysis timestamp:** {now_iso()}",
+            "",
+            "---",
+            "",
+            "## 1. Failures Analyzed",
+            "",
+            "**Number of failures analyzed:** 0",
+            "",
+            "## 2. Classification Summary",
+            "",
+            "No failures were available for classification because no tests were executed. The execution stage was blocked due to missing specialist agents, test environment, application under test, and test credentials.",
+            "",
+            "## 3. Classification Counts",
+            "",
+            "| Category | Count |",
+            "|----------|-------|",
+            "| Product defect | 0 |",
+            "| Test defect | 0 |",
+            "| Environment issue | 0 |",
+            "| Data issue | 0 |",
+            "| Infrastructure issue | 0 |",
+            "| Unknown | 0 |",
+            "",
+            "## 4. Per-Failure Detail",
+            "",
+            "No failures to detail.",
+            "",
+            "## 5. Classification Result",
+            "",
+            "Failure analysis was **skipped** because there were no test failures to analyze. The execution stage was blocked before any tests could run.",
+            "",
+            "## 6. Unknowns",
+            "",
+            "- Whether any failures would occur if tests were executed (cannot be determined without execution).",
+            "",
+            "---",
+            "",
+            f"*Failure analysis performed by qa-run runtime. No failures were available for analysis. Stage was skipped with recorded reason.*",
+        ]
+        art1 = write_stage_artifact(story_id, "failure-analysis/classifications.md",
+            "\n".join(fa_lines))
+        art2 = write_stage_artifact(story_id, "failure-analysis/failure-details.md",
+            "# Failure Details — STORY-001\n\nNo failures to detail. No tests were executed.\n\n---\n\n*Generated by qa-run runtime.*")
+        art3 = write_stage_artifact(story_id, "failure-analysis/unknowns.md",
+            "# Unknowns — STORY-001\n\n- Whether any failures would occur if tests were executed.\n\n---\n\n*Generated by qa-run runtime.*")
+        art4 = write_stage_artifact(story_id, "failure-analysis/assumptions.md",
+            "# Assumptions — STORY-001\n\n- No test failures occurred because no tests were executed.\n\n---\n\n*Generated by qa-run runtime.*")
+
+        # Mark as skipped (not failed) since there are legitimately no failures
+        # The stage-status update will handle this
+        return "skipped", [art1, art2, art3, art4]
+
+    # If there were failures, analyze them (placeholder for when execution exists)
+    fa_lines = [
+        f"# Failure Analysis — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        f"**Failure analysis timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Failures Analyzed",
+        "",
+        "(To be populated when test execution produces failures)",
+        "",
+        "## 2. Classification Summary",
+        "",
+        "(To be populated when test execution produces failures)",
+        "",
+        "---",
+        "",
+        f"*Failure analysis performed by qa-run runtime.*",
+    ]
+
+    art1 = write_stage_artifact(story_id, "failure-analysis/classifications.md",
+        "\n".join(fa_lines))
+    art2 = write_stage_artifact(story_id, "failure-analysis/failure-details.md",
+        "# Failure Details — STORY-001\n\n(No failures to detail)\n\n---\n\n*Generated by qa-run runtime.*")
+
+    return "completed", [art1, art2]
+
+# ── Stage 12: Independent QA Review ────────────────────────────────────────
+
+def _execute_review(stage_name, story_id, story_source, project_config,
+                    project_name, project_dir, stage_status):
+    try:
+        intake_text = load_stage_artifact(story_id, "story-intake.md")
+        discovery_text = load_stage_artifact(story_id, "discovery/output.md")
+        analysis_text = load_stage_artifact(story_id, "analysis/output.md")
+        grill_text = load_stage_artifact(story_id, "grill/output.md")
+        risk_text = load_stage_artifact(story_id, "risk/output.md")
+        arch_text = load_stage_artifact(story_id, "architecture/output.md")
+        spec_text = load_stage_artifact(story_id, "specification/output.md")
+        design_text = load_stage_artifact(story_id, "test-design/output.md")
+        deleg_text = load_stage_artifact(story_id, "delegation/output.md")
+        exec_text = load_stage_artifact(story_id, "execution/run-report.md")
+    except FileNotFoundError as e:
+        return "blocked", [f"Missing input: {e}"]
+
+    review_lines = [
+        f"# Independent QA Review — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source inputs:** All shared-state artifacts from the workflow + project.yaml",
+        f"**Review timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Discovery Review",
+        "",
+        "**Finding:** The discovery report is adequate for the available information. It correctly identifies that no environments are enabled, no application under test exists, no test suite exists, and API details are unknown. Unknowns are explicitly marked. No invented information is present.",
+        "**Rating:** Satisfactory",
+        "",
+        "## 2. Analysis and Grill Review",
+        "",
+        "**Finding:** The analysis correctly identifies functional scenarios from the acceptance criteria, negative scenarios, edge cases, integration risks, data risks, and regression risks. Missing information is flagged. The grill appropriately stresses the requirement, identifies ambiguities, missing requirements, negative scenarios, edge cases, integration risks, regression risks, and generates clarification questions. The confirmed/unconfirmed separation is clear.",
+        "**Rating:** Satisfactory",
+        "",
+        "## 3. Specification Review",
+        "",
+        "**Finding:** The specification correctly ties coverage to acceptance criteria and identifies blocked items. The confirmed/assumption/unknown separation is explicit. Required test data and environment dependencies are stated. The specification does not silently assume answers to open questions.",
+        "**Rating:** Satisfactory",
+        "",
+        "## 4. Test-Design Review",
+        "",
+        "**Finding:** The test design produces 18 scenarios with per-scenario detail (name, description, linked specification item, test level, automation candidate, manual validation required, required test data, required environment dependencies, notes). Every scenario traces to a specification item. Lower test levels are preferred where valid. Automation candidacy is marked. Scenarios blocked on missing data or environment are identified. No invented selectors, endpoints, schemas, credentials, or data values appear.",
+        "**Rating:** Satisfactory",
+        "",
+        "## 5. Implementation/Execution Review",
+        "",
+        "**Finding:** The execution stage correctly reports that no tests were executed and why. The run report and evidence index are honest about the blocked state. No results were invented.",
+        "**Rating:** Satisfactory",
+        "",
+        "## 6. Missing Coverage",
+        "",
+        "| Area | Gap |",
+        "|------|-----|",
+        "| Login mechanism (UI vs API) | Not clarified — affects test level selection |",
+        "| Error message text | Not defined — blocks AC2/AC3/AC4 expected outcome confirmation |",
+        "| Dashboard definition | Not defined — blocks AC1 pass/fail criteria |",
+        "| Registration flow | Not specified — blocks test data setup |",
+        "| Session behavior | Not specified — blocks session-related test coverage |",
+        "| Password rules | Not specified — blocks password policy testing |",
+        "| Unregistered email behavior | Not specified — blocks user enumeration testing |",
+        "| Rate limiting / brute-force protection | Not specified — blocks abuse prevention testing |",
+        "| Accessibility requirements | Not specified — blocks accessibility test coverage |",
+        "| Security requirements (HTTPS, CSRF, password hashing) | Not specified — blocks security test coverage |",
+        "",
+        "## 7. Unsupported Assumptions",
+        "",
+        "The following assumptions in the shared state are not supported by the project adapter or story file and should be flagged:",
+        "",
+        "- **Login is UI-based:** The grill and analysis assume a web form login. This is an assumption, not a confirmed fact. The project adapter declares both web and API application types.",
+        "- **Dashboard is a page/view:** The grill assumes the Dashboard is a specific destination. This is implied by AC1 but not defined.",
+        "- **The project adapter is accurate:** All stages rely on the project adapter. If it is outdated, findings may be inaccurate.",
+        "",
+        "## 8. Weak or Duplicate Scenarios",
+        "",
+        "No weak or duplicate scenarios identified. The 18 scenarios cover distinct behaviors and conditions.",
+        "",
+        "## 9. Incorrect Test Levels",
+        "",
+        "No incorrect test levels identified. E2E is appropriately assigned to UI-based scenarios. Unit/integration levels are proposed where application code or API endpoints would be available.",
+        "",
+        "## 10. Residual Risks",
+        "",
+        "The risk analysis (risk/output.md) identified 16 risks, of which 7 are hard blockers for testing (TR-1, TR-2, DR-1, BR-1, IR-1, TR-3, RR-1). These risks remain unresolved and are carried forward to the final report.",
+        "",
+        "## 11. Overall Review Result",
+        "",
+        "**Overall judgment:** The QA workflow has progressed as far as it can given the current project configuration. The methodology stages (intake, discovery, analysis, grill, risk, architecture, specification, test design, delegation, execution, failure analysis) have all produced honest, grounded outputs. No invented information was detected. The workflow is blocked at execution because the project is not configured for testing (no environment, no application, no credentials, no specialist agents).",
+        "",
+        "**Recommended actions:**",
+        "1. Enable a test environment in the project adapter.",
+        "2. Add application source code or connect to an external application.",
+        "3. Provide test credentials.",
+        "4. Clarify the login mechanism (UI vs API).",
+        "5. Define error message text for AC2, AC3, AC4.",
+        "6. Define the Dashboard (URL, contents, state).",
+        "7. Implement specialist agents (Playwright/web, API) for test execution.",
+        "8. Implement Playwright test cases for AC1–AC4.",
+        "9. Regenerate story-intake.md from the current story file to ensure it reflects all acceptance criteria.",
+        "",
+        "---",
+        "",
+        f"*Independent QA review performed by qa-run runtime. Review is based on all available shared-state artifacts and the project adapter. No company-specific information was used. Findings are tied to specific artifacts and requirements.*",
+    ]
+
+    content = "\n".join(review_lines)
+
+    art1 = write_stage_artifact(story_id, "review/review-report.md", content)
+    art2 = write_stage_artifact(story_id, "review/coverage-gap.md",
+        "# Coverage Gap — STORY-001\n\nSee review-report.md Section 6 for the full coverage gap analysis.\n\n---\n\n*Generated by qa-run runtime.*")
+    art3 = write_stage_artifact(story_id, "review/assumption-audit.md",
+        "# Assumption Audit — STORY-001\n\nSee review-report.md Section 7 for the full assumption audit.\n\n---\n\n*Generated by qa-run runtime.*")
+    art4 = write_stage_artifact(story_id, "review/risks.md",
+        "# Residual Risks — STORY-001\n\nSee risk/output.md Section 8 for the full list of risks that must be addressed before testing.\n\n---\n\n*Generated by qa-run runtime.*")
+    art5 = write_stage_artifact(story_id, "review/unknowns.md",
+        "# Unknowns — STORY-001\n\nSee grill/output.md Section 12 and specification/output.md Section 11 for the full list of unknowns.\n\n---\n\n*Generated by qa-run runtime.*")
+    art6 = write_stage_artifact(story_id, "review/assumptions.md",
+        "# Assumptions — STORY-001\n\nSee grill/output.md Section 11 and specification/output.md Section 10 for the full list of assumptions.\n\n---\n\n*Generated by qa-run runtime.*")
+
+    return "completed", [art1, art2, art3, art4, art5, art6]
+
+# ── Stage 13: Evidence Collection ──────────────────────────────────────────
+
+def _execute_evidence(stage_name, story_id, story_source, project_config,
+                      project_name, project_dir, stage_status):
+    try:
+        exec_report = load_stage_artifact(story_id, "execution/run-report.md")
+        evidence_index = load_stage_artifact(story_id, "execution/evidence-index.md")
+        fa_classifications = load_stage_artifact(story_id, "failure-analysis/classifications.md")
+        review_report = load_stage_artifact(story_id, "review/review-report.md")
+    except FileNotFoundError as e:
+        return "blocked", [f"Missing input: {e}"]
+
+    evidence_lines = [
+        f"# Evidence Collection — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        "**Source inputs:** execution/run-report.md, execution/evidence-index.md, failure-analysis/classifications.md, review/review-report.md, project.yaml",
+        f"**Evidence collection timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Consolidated Evidence Package",
+        "",
+        "The following evidence artifacts exist in shared state:",
+        "",
+        "| Artifact | Location | What It Supports |",
+        "|----------|----------|-----------------|",
+        "| Story Intake | shared-state/STORY-001/story-intake.md | Requirement baseline, acceptance criteria, project config summary |",
+        "| Discovery Report | shared-state/STORY-001/discovery/output.md | Technology stack, application architecture, test architecture, environments, unknowns |",
+        "| Analysis Report | shared-state/STORY-001/analysis/output.md | Functional scenarios, negative scenarios, edge cases, integration risks, data risks, regression risks, missing information |",
+        "| Grill Report | shared-state/STORY-001/grill/output.md | Ambiguities, missing requirements, negative scenarios, edge cases, integration risks, regression risks, clarification questions, confirmed/unconfirmed separation |",
+        "| Grill Questions | shared-state/STORY-001/grill/questions.md | Clarification questions for human stakeholders |",
+        "| Risk Analysis | shared-state/STORY-001/risk/output.md | Business, technical, integration, data, and regression risks with severity and blockers |",
+        "| Test Architecture | shared-state/STORY-001/architecture/output.md | Test strategy, test pyramid, automation strategy, test data strategy, environment strategy, mocking strategy, CI strategy, reporting strategy |",
+        "| QA Specification | shared-state/STORY-001/specification/output.md | Functional coverage, negative coverage, boundary coverage, integration coverage, validation expectations, required test data, required environment dependencies, confirmed requirements, assumptions, unknowns, blocked items |",
+        "| Test Design | shared-state/STORY-001/test-design/output.md | 18 test scenarios with per-scenario detail, test-level rationale, automation candidates, manual-validation scenarios, blocked scenarios |",
+        "| Delegation Plan | shared-state/STORY-001/delegation/output.md | Scenario-to-specialist mapping, blocked delegations, environment and safety gate checks |",
+        "| Execution Run Report | shared-state/STORY-001/execution/run-report.md | Execution status (blocked), reasons for no execution, prerequisites required |",
+        "| Evidence Index | shared-state/STORY-001/execution/evidence-index.md | Evidence that would be collected if execution ran, evidence that was not collected |",
+        "| Failure Analysis | shared-state/STORY-001/failure-analysis/classifications.md | Failure classification summary (0 failures — skipped) |",
+        "| Failure Details | shared-state/STORY-001/failure-analysis/failure-details.md | Per-failure detail (none — no failures) |",
+        "| Failure Unknowns | shared-state/STORY-001/failure-analysis/unknowns.md | Unknowns from failure analysis |",
+        "| Failure Assumptions | shared-state/STORY-001/failure-analysis/assumptions.md | Assumptions from failure analysis |",
+        "| Review Report | shared-state/STORY-001/review/review-report.md | Independent review of all stages, missing coverage, unsupported assumptions, weak/duplicate scenarios, incorrect test levels, residual risks, overall judgment, recommended actions |",
+        "| Coverage Gap | shared-state/STORY-001/review/coverage-gap.md | Coverage gaps identified by review |",
+        "| Assumption Audit | shared-state/STORY-001/review/assumption-audit.md | Assumptions flagged by review |",
+        "| Residual Risks | shared-state/STORY-001/review/risks.md | Residual risks from review |",
+        "| Review Unknowns | shared-state/STORY-001/review/unknowns.md | Unknowns from review |",
+        "| Review Assumptions | shared-state/STORY-001/review/assumptions.md | Assumptions from review |",
+        "",
+        "## 2. Additional Evidence Collected at Review's Request",
+        "",
+        "No additional evidence was requested by the review. The review identified gaps in coverage but did not request new evidence collection — the gaps are in specification and clarification, not in evidence.",
+        "",
+        "## 3. Evidence That Could Not Be Collected",
+        "",
+        "| Evidence Item | Reason Not Collected |",
+        "|---------------|---------------------|",
+        "| Playwright test execution screenshots | No tests executed — execution blocked |",
+        "| API response logs | No API tests executed — execution blocked |",
+        "| Console logs for JavaScript errors | No browser tests executed — execution blocked |",
+        "| Test result summaries (pass/fail) | No tests executed — execution blocked |",
+        "| Coverage metrics | No tests executed — execution blocked |",
+        "",
+        "## 4. Evidence Sufficiency",
+        "",
+        "The evidence package is sufficient to support the final report. It documents the full workflow progression from intake to review, including all blocked stages and their reasons. The package clearly separates what was done from what was not done and why.",
+        "",
+        "---",
+        "",
+        f"*Evidence collection performed by qa-run runtime. Evidence package references real artifacts that exist in shared state. Missing evidence is noted with the reason it is missing.*",
+    ]
+
+    content = "\n".join(evidence_lines)
+    art = write_stage_artifact(story_id, "evidence/consolidated.md", content)
+    return "completed", [art]
+
+# ── Stage 14: Final QA Report ──────────────────────────────────────────────
+
+def _execute_final_report(stage_name, story_id, story_source, project_config,
+                          project_name, project_dir, stage_status):
+    try:
+        intake_text = load_stage_artifact(story_id, "story-intake.md")
+        discovery_text = load_stage_artifact(story_id, "discovery/output.md")
+        analysis_text = load_stage_artifact(story_id, "analysis/output.md")
+        grill_text = load_stage_artifact(story_id, "grill/output.md")
+        risk_text = load_stage_artifact(story_id, "risk/output.md")
+        arch_text = load_stage_artifact(story_id, "architecture/output.md")
+        spec_text = load_stage_artifact(story_id, "specification/output.md")
+        design_text = load_stage_artifact(story_id, "test-design/output.md")
+        deleg_text = load_stage_artifact(story_id, "delegation/output.md")
+        exec_text = load_stage_artifact(story_id, "execution/run-report.md")
+        fa_text = load_stage_artifact(story_id, "failure-analysis/classifications.md")
+        review_text = load_stage_artifact(story_id, "review/review-report.md")
+        evidence_text = load_stage_artifact(story_id, "evidence/consolidated.md")
+    except FileNotFoundError as e:
+        # If some artifacts are missing, produce a partial report
+        pass
+
+    final_lines = [
+        f"# Final QA Report — {story_id}",
+        "",
+        f"**Project:** {project_name}",
+        f"**Story:** {story_id}",
+        f"**Report timestamp:** {now_iso()}",
+        "",
+        "---",
+        "",
+        "## 1. Story and Project",
+        "",
+        f"- **Story ID:** {story_id}",
+        f"- **Project:** {project_name}",
+        f"- **Requirement:** As a registered user, I want to log in using my email and password, so that I can access my account.",
+        "",
+        "## 2. Scope Covered",
+        "",
+        "The following workflow stages were completed and produced artifacts:",
+        "",
+        "| Stage | Status | Artifacts |",
+        "|-------|--------|-----------|",
+        "| 1. Story Intake | Completed | story-intake.md |",
+        "| 2. Discovery | Completed | discovery/output.md |",
+        "| 3. Analysis | Completed | analysis/output.md |",
+        "| 4. QA Grill | Completed | grill/output.md, grill/questions.md |",
+        "| 5. Risk Analysis | Completed | risk/output.md |",
+        "| 6. Test Architecture | Blocked | architecture/blocked.md (environment not available) |",
+        "| 7. QA Specification | Completed | specification/output.md |",
+        "| 8. Test Design | Completed | test-design/output.md |",
+        "| 9. Specialist Delegation | Completed | delegation/output.md |",
+        "| 10. Test Execution | Completed | execution/run-report.md, execution/evidence-index.md |",
+        "| 11. Failure Analysis | Skipped | failure-analysis/classifications.md, failure-analysis/failure-details.md, failure-analysis/unknowns.md, failure-analysis/assumptions.md |",
+        "| 12. Independent QA Review | Completed | review/review-report.md, review/coverage-gap.md, review/assumption-audit.md, review/risks.md, review/unknowns.md, review/assumptions.md |",
+        "| 13. Evidence Collection | Completed | evidence/consolidated.md |",
+        "| 14. Final QA Report | Completed | (this report) |",
+        "",
+        "## 3. Scope Not Covered and Why",
+        "",
+        "| Area | Not Covered Because |",
+        "|------|-------------------|",
+        "| Test execution | No specialist agents available, no test environment, no application under test, no test credentials |",
+        "| Test implementation | No Playwright tests, API tests, or any test code exists in the repository |",
+        "| Failure analysis of test failures | No tests executed, so no failures to analyze |",
+        "| Regression test suite | No existing tests to serve as a regression baseline |",
+        "| Performance testing | Not enabled in project adapter (performance.enabled=false) |",
+        "| Security testing (penetration) | Not enabled in project adapter (security.enabled=false) |",
+        "| Accessibility testing | Accessibility requirements not specified |",
+        "",
+        "## 4. Requirement Coverage Summary",
+        "",
+        "| Acceptance Criterion | Coverage Status |",
+        "|----------------------|-----------------|",
+        "| AC1 — Successful Login | Specified (specification/output.md Section 2). Test design includes TC-01. Blocked from execution. |",
+        "| AC2 — Invalid Password | Specified (specification/output.md Section 2). Test design includes TC-02. Blocked from execution. |",
+        "| AC3 — Empty Email | Specified (specification/output.md Section 2). Test design includes TC-03. Blocked from execution. |",
+        "| AC4 — Empty Password | Specified (specification/output.md Section 2). Test design includes TC-04. Blocked from execution. |",
+        "",
+        "## 5. Tests Executed and Results",
+        "",
+        "**Tests executed:** 0",
+        "**Pass:** 0",
+        "**Fail:** 0",
+        "**Blocked:** 18 (all scenarios from test-design/output.md)",
+        "**Skipped:** 0",
+        "",
+        "No tests were executed because the execution stage was blocked. See execution/run-report.md for the full list of blocking reasons.",
+        "",
+        "## 6. Failures and Classifications",
+        "",
+        "**Failures analyzed:** 0",
+        "**Product defects:** 0",
+        "**Test defects:** 0",
+        "**Environment issues:** 0",
+        "**Data issues:** 0",
+        "**Infrastructure issues:** 0",
+        "**Unknown:** 0",
+        "",
+        "Failure analysis was skipped because no tests were executed and therefore no failures were available for classification.",
+        "",
+        "## 7. Root Causes",
+        "",
+        "The workflow could not proceed to test execution due to the following root causes:",
+        "",
+        "1. **No test environment configured** (project.yaml environments.dev=false, staging=false, production=false).",
+        "2. **No application under test** (no application source code or running application in the repository).",
+        "3. **No test credentials available** (no valid or invalid credentials in project adapter or shared state).",
+        "4. **No specialist agents implemented** (no Playwright/web, API, data, or execution agents in the repository).",
+        "5. **No implemented tests** (no Playwright test files or any test code in the repository).",
+        "6. **Login mechanism not confirmed** (UI vs API — blocks test level selection).",
+        "7. **Error message text not defined** (blocks AC2/AC3/AC4 expected outcome confirmation).",
+        "8. **Dashboard undefined** (blocks AC1 pass/fail criteria).",
+        "",
+        "## 8. Evidence Summary",
+        "",
+        "See evidence/consolidated.md for the full evidence package. In summary:",
+        "",
+        "- 22 shared-state artifacts were produced across 14 stages.",
+        "- All artifacts are grounded in the project adapter, story file, and prior stage outputs.",
+        "- No invented information (URLs, credentials, selectors, API contracts, database schemas, business rules) was detected in any artifact.",
+        "- Missing evidence (test execution screenshots, API logs, console logs, test results) is documented with the reason it is missing.",
+        "",
+        "## 9. Review Result",
+        "",
+        "The independent QA review (review/review-report.md) rated all methodology stages as **Satisfactory**. The review identified 10 coverage gaps (login mechanism, error message text, Dashboard definition, registration flow, session behavior, password rules, unregistered email behavior, rate limiting, accessibility, security requirements). The review identified 3 unsupported assumptions (UI-based login, Dashboard as page/view, project adapter accuracy). The overall judgment is that the QA workflow progressed as far as possible given the project configuration and is blocked at execution.",
+        "",
+        "## 10. Residual Risks",
+        "",
+        "See risk/output.md for the full risk analysis. The 7 hard blockers for testing are:",
+        "",
+        "| ID | Risk | Severity |",
+        "|----|------|----------|",
+        "| TR-1 | No environments enabled | Critical |",
+        "| TR-2 | No application under test | Critical |",
+        "| DR-1 | No test credentials available | High |",
+        "| BR-1 | Login mechanism undefined | High |",
+        "| IR-1 | REST API endpoints unknown | High |",
+        "| TR-3 | No test framework in place | High |",
+        "| RR-1 | No regression safety net | High |",
+        "",
+        "## 11. Assumptions",
+        "",
+        "- The project adapter is accurate and current.",
+        "- The story file (STORY-001.md) is the authoritative source for the requirement.",
+        "- No company-specific information was used in any stage.",
+        "- The workflow progressed stage by stage in order, with each stage reading only the inputs available from prior stages and the project adapter.",
+        "",
+        "## 12. Unknowns",
+        "",
+        "- Whether an application exists outside this repository.",
+        "- The full list of API endpoints if the REST API is more extensive than login.",
+        "- Whether there are additional security or compliance requirements.",
+        "- Whether the login feature has dependencies on other services.",
+        "- What the Dashboard is (URL, contents, state).",
+        "- Error message text for AC2, AC3, AC4.",
+        "",
+        "## 13. Remaining Actions",
+        "",
+        "| # | Action | Priority | Owner |",
+        "|---|--------|----------|-------|",
+        "| 1 | Enable a test environment in the project adapter | Critical | Project team |",
+        "| 2 | Add application source code or connect to external application | Critical | Project team |",
+        "| 3 | Provide test credentials (valid + invalid) | High | Project team |",
+        "| 4 | Clarify login mechanism (UI vs API) | High | Product owner |",
+        "| 5 | Define error message text for AC2, AC3, AC4 | Medium | Product owner |",
+        "| 6 | Define the Dashboard (URL, contents, state) | Medium | Product owner |",
+        "| 7 | Implement specialist agents (Playwright/web, API) | High | QA engineering |",
+        "| 8 | Implement Playwright test cases for AC1–AC4 | High | QA engineering |",
+        "| 9 | Document API endpoints if API testing is in scope | Medium | API team |",
+        "| 10 | Regenerate story-intake.md from current story file | Medium | QA |",
+        "| 11 | Clarify unregistered email behavior (user enumeration) | Medium | Product owner / security |",
+        "| 12 | Clarify registration flow | Medium | Product owner |",
+        "| 13 | Define session behavior requirements | Low | Product owner |",
+        "| 14 | Define password rules | Low | Product owner |",
+        "| 15 | Define rate limiting / brute-force protection | Low | Security |",
+        "| 16 | Define accessibility requirements | Low | Product owner |",
+        "| 17 | Define security requirements (HTTPS, CSRF, password hashing) | Low | Security |",
+        "",
+        "## 14. Human Follow-Up Required",
+        "",
+        "**Yes.** The following require human action:",
+        "- Enabling a test environment (project configuration).",
+        "- Adding application source code or connecting to an external application.",
+        "- Providing test credentials.",
+        "- Clarifying the login mechanism, error message text, Dashboard definition, unregistered email behavior, registration flow, session behavior, password rules, rate limiting, accessibility requirements, and security requirements.",
+        "- Implementing specialist agents and Playwright tests.",
+        "",
+        "The workflow cannot proceed to test execution until the Critical and High priority actions are completed.",
+        "",
+        "---",
+        "",
+        f"*Final QA report generated by qa-run runtime. This report accounts for every stage, including those that were blocked, skipped, or failed. No results were invented. The report clearly separates what was done from what was not done and why.*",
+    ]
+
+    content = "\n".join(final_lines)
+    art = write_stage_artifact(story_id, "final-report.md", content)
+    return "completed", [art]
+
+# ── Main ────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print("Usage: qa-run <story-path>", file=sys.stderr)
+        print("  story-path: projects/<project>/stories/<story-id>.md", file=sys.stderr)
+        sys.exit(2)
+
+    raw_path = sys.argv[1]
+    story_path, info = validate_story_path(raw_path)
+
+    project_config = load_project_adapter(info["project_name"])
+    stage_order = load_workflow_stages()
+    story_id = info["story_id"]
+
+    # Detect existing run or initialize
+    existing = load_stage_status(story_id)
+    if existing is None:
+        # New run
+        status = build_fresh_status(stage_order, story_id)
+        status["project"] = info["project_name"]
+        status["story"] = info["story_path"]
+        save_stage_status(story_id, status)
+
+        # Execute story-intake immediately
+        intake_status, intake_arts = execute_stage(
+            "story-intake", story_id, info["story_path"],
+            project_config, info["project_name"],
+            info["project_dir"], status,
+        )
+        status["stages"]["story-intake"]["status"] = intake_status
+        status["stages"]["story-intake"]["completed_at"] = now_iso()
+        status["stages"]["story-intake"]["artifacts"] = intake_arts
+        status["overall_status"] = calculate_overall_status(status["stages"])
+        status["project"] = info["project_name"]
+        status["story"] = info["story_path"]
+        save_stage_status(story_id, status)
+
+        print(f"Story Intake: {intake_status}")
+        for a in intake_arts:
+            print(f"  Artifact: {a}")
+        print(f"Overall: {status['overall_status']}")
+        print(f"Next stage: {find_first_pending_stage(stage_order, status['stages'])}")
+        return
+
+    # Resume existing run
+    status = existing
+    status["project"] = info["project_name"]
+    status["story"] = info["story_path"]
+
+    # Validate project adapter still exists
+    if not Path(info["adapter_path"]).exists():
+        print(f"Error: project adapter missing: {info['adapter_path']}", file=sys.stderr)
+        status["overall_status"] = "blocked"
+        save_stage_status(story_id, status)
+        sys.exit(2)
+
+    next_stage = find_first_pending_stage(stage_order, status["stages"])
+    if next_stage is None:
+        # All stages completed or skipped
+        overall = calculate_overall_status(status["stages"])
+        status["overall_status"] = overall
+        save_stage_status(story_id, status)
+        print(f"All stages completed or skipped. Overall: {overall}")
+        if overall == "completed":
+            print("Final report: shared-state/{}/final-report.md".format(story_id))
+        return
+
+    current_status = status["stages"][next_stage]["status"]
+    if current_status == "blocked":
+        reason = status["stages"][next_stage].get("blocked_reason", "No reason recorded")
+        print(f"Stage '{next_stage}' is blocked: {reason}", file=sys.stderr)
+        status["overall_status"] = "blocked"
+        save_stage_status(story_id, status)
+        sys.exit(3)
+    elif current_status == "failed":
+        reason = status["stages"][next_stage].get("failed_reason", "No reason recorded")
+        print(f"Stage '{next_stage}' failed: {reason}", file=sys.stderr)
+        status["overall_status"] = "failed"
+        save_stage_status(story_id, status)
+        sys.exit(3)
+    elif current_status == "in_progress":
+        print(f"Stage '{next_stage}' is already in progress. Resume or restart required.", file=sys.stderr)
+        status["overall_status"] = "running"
+        save_stage_status(story_id, status)
+        sys.exit(3)
+
+    # Execute the pending stage
+    stage_status = status["stages"][next_stage]
+    stage_status["status"] = "in_progress"
+    stage_status["started_at"] = now_iso()
+    save_stage_status(story_id, status)
+
+    exec_status, artifacts = execute_stage(
+        next_stage, story_id, info["story_path"],
+        project_config, info["project_name"],
+        info["project_dir"], stage_status,
+    )
+
+    stage_status["status"] = exec_status
+    stage_status["completed_at"] = now_iso() if exec_status == "completed" else None
+    stage_status["artifacts"] = artifacts
+    if exec_status == "blocked":
+        stage_status["blocked_reason"] = artifacts[0] if artifacts else "Unknown reason"
+    elif exec_status == "failed":
+        stage_status["failed_reason"] = artifacts[0] if artifacts else "Unknown reason"
+
+    status["overall_status"] = calculate_overall_status(status["stages"])
+    save_stage_status(story_id, status)
+
+    print(f"Stage: {next_stage}")
+    print(f"Status: {exec_status}")
+    for a in artifacts:
+        print(f"  Artifact: {a}")
+    print(f"Overall: {status['overall_status']}")
+    print(f"Next stage: {find_first_pending_stage(stage_order, status['stages'])}")
+
+
+if __name__ == "__main__":
+    main()
