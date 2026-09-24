@@ -10,6 +10,24 @@ Company-specific information belongs in `projects/<project-name>/`. The framewor
 
 ---
 
+## Prerequisites
+
+**System:**
+- Python 3.10+ 
+- pip
+
+**In the target project repository (the one with your Playwright/Cypress/pytest specs):**
+- Test specs already written and committed
+- Dependencies installed (`npm install`, `pip install`, etc.)
+- A working test command (e.g. `npx playwright test`, `pytest`, `npm run test`)
+- If tests need a running server/API, start it before running the harness
+
+**For AI mode (optional):**
+- An LLM provider API key (OpenAI, Anthropic, etc.) set as an environment variable
+- See `config/ai.yaml` and the [AI Mode](#ai-mode) section below
+
+---
+
 ## What This Framework Does
 
 The QA Agent Harness is an **orchestration layer** — it sits above your existing automation and drives the full QA process around it. It does NOT replace Playwright, Cypress, pytest, or any test framework you already use.
@@ -213,15 +231,237 @@ python3 qa-run projects/my-project/stories/STORY-001.md
 
 Run repeatedly — each invocation advances exactly one stage. Stop when you see:
 
-```
+```text
 All stages completed or skipped. Overall: completed
 ```
+
+### 5a. Full-Run Mode
+
+To execute all remaining stages in a single command, use the `--full-run` flag:
+
+```bash
+python3 qa-run projects/my-project/stories/STORY-001.md --full-run
+```
+
+This runs every pending stage sequentially until the workflow reaches one of these endpoints:
+
+- **All stages completed** — every stage is `completed` or `skipped` with a recorded reason.
+- **A failed stage** — the workflow stops and exits with code 3.
+- **A persistently blocked stage** — if a stage returns `blocked` twice consecutively, the workflow stops to avoid an infinite loop and exits with a warning.
+
+In `--full-run` mode, output is separated by `---` between stages:
+
+```text
+Story Intake: completed
+  Artifact: shared-state/STORY-001/story-intake.md
+Overall: partial
+Next stage: discovery
+---
+Stage: discovery
+Status: completed
+  Artifact: shared-state/STORY-001/discovery/output.md
+Overall: partial
+---
+Stage: analysis
+Status: completed
+...
+```
+
+The `--full-run` flag does not change the default one-stage-per-invocation behavior. Without the flag, `qa-run` still advances exactly one stage per invocation.
 
 ### 6. Read the Report
 
 ```bash
 cat shared-state/STORY-001/final-report.md
 ```
+
+---
+
+## Manual Run (Default — One Stage Per Invocation)
+
+The framework runs **one workflow stage per invocation**. Run the same command repeatedly to step through the full workflow.
+
+### Step-by-step
+
+**1. Install harness dependencies:**
+```bash
+cd /Users/t/Desktop/qa-agent-harness
+pip install -r requirements.txt
+```
+
+**2. Copy the template:**
+```bash
+cp -r projects/template projects/my-project
+```
+
+**3. Configure `projects/my-project/project.yaml`:**
+
+Edit the copy to match your project:
+```yaml
+project:
+  name: my-project
+  description: Your application description
+
+application:
+  web: true
+  api: true
+  mobile: false
+
+automation:
+  framework: playwright   # playwright | cypress | pytest | other
+  language: javascript    # javascript | python | java
+
+target_repository:
+  path: ../target-playwright-repo   # relative path to the repo with your test specs
+
+environments:
+  staging: true   # or dev: true — whichever environment you have
+
+safety:
+  production_execution: false
+  real_payments: false
+  destructive_database_operations: false
+```
+
+**Required fields:** `project.name`, `application`, `automation`, `safety`
+
+**Optional:** `target_repository` (needed for execution stage), `api`, `database`, `environments`, `performance`, `security`, `accessibility`, `visual`, `events`, `webhooks`, `ci`, `test_data`, `secrets`
+
+**4. Write a story:**
+
+Copy the story template and edit it:
+```bash
+cp projects/my-project/stories/STORY-TEMPLATE-001.md projects/my-project/stories/STORY-LOGIN-001.md
+```
+
+Edit with your user story and acceptance criteria:
+```markdown
+# STORY-LOGIN-001
+
+## User Story
+
+As a registered user, I want to log in with email and password, so that I can access my account.
+
+## Acceptance Criteria
+
+### AC1 — Successful Login
+
+Given a registered user with valid email and valid password  
+When the user performs the login action  
+Then the user is redirected to the Dashboard  
+
+### AC2 — Invalid Password
+
+Given a registered user with valid email and invalid password  
+When the user performs the login action  
+Then an error message is shown  
+```
+
+**Minimum required:** a title (`# STORY-xxx`), a User Story section, and at least one Acceptance Criterion.
+
+**5. Start the target server (if needed):**
+
+If your tests need a running application, start it before running the harness:
+```bash
+cd ../target-playwright-repo
+npm run start-server   # or your start command
+```
+Leave it running in another terminal.
+
+**6. Run stage 1 — Story Intake:**
+```bash
+python3 qa-run projects/my-project/stories/STORY-LOGIN-001.md
+```
+
+**7. Keep running the same command** — each invocation advances one stage:
+```bash
+python3 qa-run projects/my-project/stories/STORY-LOGIN-001.md
+```
+
+When you see this, the workflow is done:
+```
+All stages completed or skipped. Overall: completed
+```
+
+**8. Read the results:**
+
+```bash
+cat shared-state/STORY-LOGIN-001/final-report.md
+```
+
+Key artifacts:
+| File | What it contains |
+|---|---|
+| `discovery/output.md` | What the harness found in your target repo (framework, specs, config, env) |
+| `analysis/output.md` | Derived test scenarios from your story |
+| `delegation/output.md` | Which skills were selected and why |
+| `execution/run-report.md` | Test execution results |
+| `final-report.md` | Complete QA report — pass/fail, coverage gaps, risks |
+
+---
+
+## AI Mode
+
+AI mode delegates each workflow stage to a configured LLM provider instead of using the default heuristic agents. The harness still manages the 14-stage workflow, tracks state, and produces the same artifacts — but each stage's reasoning is generated by the LLM.
+
+### Configure AI provider
+
+Edit `config/ai.yaml`:
+
+```yaml
+ai:
+  enabled: true
+  provider: openai          # openai | anthropic | custom
+  model: gpt-4o             # check your provider's model name
+  temperature: 0.3
+  timeout_s: 60.0
+  max_tokens: 4096
+  prompt_version: v1.0
+  max_retries: 1
+  retry_delay_s: 2.0
+```
+
+Set the provider API key as an environment variable — typically `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`. See `config/ai.yaml` comments for the exact variable name your provider needs.
+
+**Do not commit `config/ai.yaml` with real credentials.** The `.gitignore` excludes `.env` files — put credentials there and use `config/ai.yaml` only for the provider/model config.
+
+### Run with AI mode
+
+Same commands — the harness reads `config/ai.yaml` automatically:
+
+```bash
+# One stage at a time
+python3 qa-run projects/my-project/stories/STORY-LOGIN-001.md
+
+# Or full-run all stages at once
+python3 qa-run projects/my-project/stories/STORY-LOGIN-001.md --full-run
+```
+
+When AI mode is enabled, each stage delegates to the configured LLM. The stage status file (`shared-state/STORY-LOGIN-001/stage-status.json`) records which mode was used. Artifacts are produced the same way regardless of mode.
+
+### When to use AI mode
+
+- When you want the analysis, grill, risk, and review stages to have richer reasoning than the default heuristics provide
+- When your stories are complex and the default agents produce shallow output
+- When you have an LLM provider available and want to compare AI-generated vs default output
+
+### When manual run is enough
+
+- Quick smoke tests against simple stories
+- When you don't have an LLM provider configured
+- When the default heuristics already produce adequate results for your use case
+
+---
+
+## Full-Run Mode
+
+To execute all remaining stages in a single command:
+
+```bash
+python3 qa-run projects/my-project/stories/STORY-LOGIN-001.md --full-run
+```
+
+Stops on first failure or if a stage gets blocked twice. Same commands work in both manual and AI mode.
 
 ---
 
@@ -407,17 +647,13 @@ When `production_execution: true`, the framework warns before executing against 
 │   ├── qa-review/ SKILL.md
 │   └── risk/ SKILL.md
 ├── projects/
-│   ├── demo/
-│   │   ├── project.yaml            # Demo project config (has target_repository)
-│   │   └── stories/                # (demo stories removed — add your own)
-│   └── template/
-│       └── project.yaml            # Clean reusable template (start from this)
-├── shared-state/                   # Runtime artifacts (git-ignored)
+│   └── template/                  # Clean starter template (copy this)
+│       ├── project.yaml           # Project configuration (edit this)
+│       └── stories/
+│           └── STORY-TEMPLATE-001.md  # Story template (copy and rename)
+├── shared-state/                   # Runtime artifacts (git-ignored, auto-created)
 │   └── <STORY-ID>/
 ├── requirements.txt                # Python dependencies (PyYAML)
-├── .gitignore
-├── INTEGRATION_REPORT.md           # Target project integration architecture
-├── STATUS_REPORT.md                # Current state, completed items, missing items
 └── README.md                       # This file
 ```
 
@@ -457,15 +693,3 @@ The framework is functional for the analysis, design, delegation, and reporting 
 3. **Remote/CI workspace support** — the `target_repository.ci_workspace` flag exists but workspace provisioning (git clone, env injection, container execution) is not implemented.
 
 4. **Live target server** — if your tests need a running server/API, you must start it yourself before running the framework. The framework does not start target services.
-
-For details, see `STATUS_REPORT.md`.
-
----
-
-## Architecture Documents
-
-- `INTEGRATION_REPORT.md` — target project integration architecture (how discovery, capability detection, and safe execution work)
-- `STATUS_REPORT.md` — current state, what's done, what's missing
-- `adapters/project_adapter.py` — target discovery implementation
-- `adapters/skill_selector.py` — skill selection implementation
-- `adapters/specialists.py` — Playwright and API specialist implementations

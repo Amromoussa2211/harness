@@ -561,60 +561,309 @@ The orchestrator passes each delegation record to the assigned specialist agent.
 
 **Required inputs:**
 - The delegation records.
-- The implemented tests produced by the delegated specialists.
+- The test-design output (scenarios).
 - The project adapter.
 - The shared state from all prior stages.
 
 **Shared-state inputs:**
 - `shared-state/<story-id>/delegation/output.md`
-- All specialist outputs.
+- `shared-state/<story-id>/test-design/output.md`
 - `projects/<project-name>/project.yaml`
 - All prior stage outputs.
 
 **Expected output:**
+- Executable Playwright spec file (if web tests are in scope).
+- Network capture data (if web execution is possible).
+- Request inventory (from captured network data or approved API inventory).
+- Performance test scripts (k6 load-test.js and stress-test.js, if performance
+  is enabled and requests are available).
 - Which tests ran.
 - Which environment was used.
 - Pass/fail summary.
 - Evidence index.
 - Blocked or skipped tests with reasons.
+- Execution status: `generated | ready | running | passed | failed | blocked`.
+- Performance status: `not_attempted | scripts_generated | ready | running |
+  passed | failed | blocked`.
 
 **Shared-state output:**
 - `shared-state/<story-id>/execution/run-report.md`
 - `shared-state/<story-id>/execution/evidence-index.md`
-- Per-test evidence artifacts as referenced in the evidence index.
+- `shared-state/<story-id>/execution/spec/<story-id>.spec.js` (if generated)
+- `shared-state/<story-id>/execution/network/network-requests.json` (if captured)
+- `shared-state/<story-id>/execution/network/network-summary.md` (if useful)
+- `shared-state/<story-id>/performance/request-inventory.json` (if generated)
+- `shared-state/<story-id>/performance/load-test.js` (if generated)
+- `shared-state/<story-id>/performance/stress-test.js` (if generated)
+- `shared-state/<story-id>/performance/results/load-summary.json` (if executed)
+- `shared-state/<story-id>/performance/results/stress-summary.json` (if executed)
+- `shared-state/<story-id>/performance/reports/performance-report.md` (if generated)
+- `shared-state/<story-id>/performance/graphs/*.png` (if generated)
 
 **Preconditions:**
 - Stage 9 is `completed`.
-- Implemented tests exist for the delegations that are scheduled to run.
+- Implemented tests exist for the delegations that are scheduled to run,
+  OR the execution stage can generate executable specs from the test-design
+  scenarios.
 - The target environment is declared in the project adapter and available.
 - Safety gates permit the intended execution.
 
-**Validation checks:**
-- Only tests that were implemented are executed. The execution stage does not create new tests.
-- Execution uses only environments declared in the project adapter.
-- Safety gates are respected.
-- Evidence is collected and indexed.
+**Execution sub-flow:**
+
+The execution stage consists of the following sub-steps, executed in order:
+
+#### 10a. Spec Generation
+
+Before executing any tests, the execution agent attempts to generate an
+executable Playwright test spec from the test-design scenarios.
+
+**Process:**
+1. Read `shared-state/<story-id>/test-design/output.md` and extract scenarios.
+2. Read the project adapter for the application base URL (if declared).
+3. Generate a real Playwright spec file using the execution skill helper
+   `generate_playwright_spec`.
+4. Save the spec to `shared-state/<story-id>/execution/spec/<story-id>.spec.js`.
+
+**Spec generation status values:**
+- `generated` — spec file was created successfully.
+- `blocked` — spec could not be generated (e.g., no scenarios, no base URL).
+
+**Generated spec requirements:**
+- Must be a real, syntactically valid JavaScript file.
+- Must include network capture instrumentation (Playwright request/response
+  events or HAR capture).
+- Must clearly mark placeholder selectors, URLs, and test data as placeholders.
+- Must NOT contain invented credentials, API contracts, or business rules.
+- If critical information is missing (base URL, selectors), the spec must
+  clearly identify the missing dependency and set execution status to `blocked`.
+
+#### 10b. Playwright Execution
+
+Execute the generated Playwright test when ALL of these are true:
+- The project is configured for Playwright (automation.framework = playwright).
+- An approved environment exists (environments.dev or staging = true).
+- Required credentials/configuration exist (or are not required for the test).
+- Required information is available (base URL, selectors — or placeholders
+  are acceptable for a first execution attempt).
+
+**Rules:**
+- Use real Playwright execution via the existing specialist mechanism.
+- Do NOT simulate execution.
+- Do NOT generate fake pass/fail results.
+- Do NOT mark execution completed just because the spec was generated.
+- If the environment is unavailable, execution status = `blocked` and a
+  truthful run report explains the blocker.
+
+**Execution status values:**
+`generated | ready | running | passed | failed | blocked`
+
+#### 10c. Network Request Capture
+
+During Web Playwright execution, capture network activity using Playwright's
+request/response events or HAR capture.
+
+**Collect at minimum:**
+- Request URL (sanitized).
+- HTTP method.
+- Resource type.
+- Response status.
+- Response timing.
+- Request timing.
+- Response size (when available).
+
+**Sanitization is MANDATORY before persisting:**
+
+Captured network data may contain: Authorization headers, cookies, tokens,
+session IDs, API keys, personal data, payment information.
+
+Before writing any captured request to shared state, sanitize:
+- `Authorization` → `<REDACTED>`
+- `Cookie` → `<REDACTED>`
+- `Set-Cookie` → `<REDACTED>`
+- API keys, bearer tokens, session tokens → `<REDACTED>`
+- Passwords → `<REDACTED>`
+- Payment secrets → `<REDACTED>`
+- Sensitive query parameters (`token`, `access_token`, `session`, `sig`,
+  `apikey`, `api_key`, `key`, `secret`, `password`) → `<REDACTED>`
+
+The original secret must NEVER be copied into: HAR, JSON, Markdown, k6 scripts,
+reports, or logs.
+
+**Network capture output:**
+- `shared-state/<story-id>/execution/network/network-requests.json`
+- `shared-state/<story-id>/execution/network/network-summary.md` (if useful)
+
+#### 10d. Request Classification
+
+Do NOT automatically convert every browser request into a performance test.
+
+Classify captured requests into categories:
+- `business_api` — application/business API endpoints.
+- `authentication` — login, token, session endpoints.
+- `static_asset` — CSS, JS, images, fonts (exclude from performance).
+- `analytics` — Google Analytics, telemetry, tracking (exclude).
+- `third_party` — external services not owned by the project (exclude).
+- `browser_internal` — browser-internal requests (exclude).
+- `unknown` — cannot classify (review required).
+
+Performance testing focuses on application/business APIs, relevant
+authentication APIs when explicitly allowed, and critical requests related
+to the story. Do NOT load-test static assets, analytics, third-party
+services, or browser internals.
+
+#### 10e. Request Inventory Generation
+
+Generate a request inventory from classified and sanitized network data:
+
+`shared-state/<story-id>/performance/request-inventory.json`
+
+Fields per request:
+- `method`
+- `sanitized_url`
+- `category`
+- `selected_for_performance`
+- `reason`
+- `source_artifact`
+
+#### 10f. Performance Test Script Generation
+
+Generate k6 scripts from the approved request inventory:
+
+- `shared-state/<story-id>/performance/load-test.js`
+- `shared-state/<story-id>/performance/stress-test.js`
+
+**Rules:**
+- Generate from captured/approved requests only.
+- Do NOT hardcode company-specific endpoints.
+- Do NOT invent request payloads.
+- If a request body is required but cannot be safely captured or
+  reconstructed, mark that request as blocked.
+- Do NOT guess the payload.
+
+**Performance script generation status:**
+- `scripts_generated` — k6 scripts were created.
+- `blocked` — scripts could not be generated (no requests, no k6, etc.).
+
+#### 10g. k6 Execution (Performance Testing)
+
+**k6 availability check:**
+1. Check whether k6 is installed (`k6 version`).
+2. If not installed, report as a **dependency blocker**.
+3. Do NOT install system-wide dependencies without explicit project permission.
+4. If k6 is unavailable, the performance stage is **BLOCKED**.
+
+**If k6 is available and execution is permitted:**
+1. Run load test: `k6 run shared-state/<story-id>/performance/load-test.js`.
+2. Run stress test: `k6 run shared-state/<story-id>/performance/stress-test.js`.
+3. Parse k6 output for metrics (p50, p90, p95, p99, throughput, error rate).
+4. Save results to `shared-state/<story-id>/performance/results/`.
+5. Generate performance report: `shared-state/<story-id>/performance/reports/performance-report.md`.
+6. Generate graphs if data supports them.
+
+**If k6 is unavailable:**
+- Performance status = `blocked`.
+- Reason: `"k6 not installed — install k6 to enable performance testing.
+  Installation requires explicit project permission."`
+- Do NOT fabricate performance results.
+- k6 scripts are still generated (valid artifacts even if not executed).
+
+**Performance thresholds:**
+Support configurable thresholds: p50, p90, p95, p99, error rate, request rate,
+throughput, timeout rate. If the project/story does not provide thresholds,
+report measurements without claiming pass/fail against invented SLA. The report
+must state: "Measured only — no project-specific performance threshold was provided."
+
+**Safety:**
+- Do NOT run performance tests against production.
+- Do NOT execute real financial transactions.
+- Do NOT send uncontrolled traffic.
+- Do NOT expose credentials in k6 scripts or reports.
+
+**Performance execution status values:**
+`not_attempted | scripts_generated | ready | running | passed | failed | blocked`
+
+#### 10h. Execution Report
+
+Build the execution run report covering:
+- Spec generation status and path.
+- Playwright execution status, tests passed/failed/blocked.
+- Network capture status and request count.
+- Request inventory status and path.
+- Performance script generation status.
+- k6 execution status (if attempted).
+- Performance metrics (if k6 executed).
+- Blockers (with specific reasons).
+- Evidence index.
+
+**Example execution summary in run-report.md:**
+
+```
+Execution:
+  - Spec generated: YES — shared-state/<story>/execution/spec/<story>.spec.js
+  - Playwright executed: YES/NO/BLOCKED
+  - Tests passed: X
+  - Tests failed: Y
+  - Network captured: YES/NO
+  - Requests captured: X
+
+Performance:
+  - Request inventory generated: YES/NO
+  - Load test script generated: YES/NO
+  - Load test executed: YES/NO/BLOCKED
+  - Stress test script generated: YES/NO
+  - Stress test executed: YES/NO/BLOCKED
+  - p95: X ms (if executed)
+  - p99: X ms (if executed)
+  - Error rate: X% (if executed)
+  - Graphs generated: YES/NO
+```
+
+If blocked:
+
+```
+Execution: BLOCKED  Reason: no approved environment / no base URL / k6 not installed
+Performance: BLOCKED  Reason: k6 not installed / no executable performance target
+```
+
+NEVER replace BLOCKED with PASSED or COMPLETED.
 
 **Failure behavior:**
-- If the target environment is unavailable, the execution stage marks the affected tests as `blocked` with the reason `environment unavailable`. The orchestrator records the environment problem and continues with any executions that do not depend on that environment.
-- If no implemented tests exist for a delegation, the execution stage marks that delegation as `blocked` with the reason `no implemented tests`. The orchestrator records the gap.
-- If execution fails due to a runtime error not caused by the application, the execution stage records the failure as a test or environment issue and continues with the remaining tests where possible.
-- If execution is blocked by a safety gate, the stage marks the affected tests as `blocked` with the safety constraint and continues with others.
+- If the target environment is unavailable, the execution stage marks the
+  affected tests as `blocked` with the reason `environment unavailable`.
+- If no implemented tests exist for a delegation, the execution stage marks
+  that delegation as `blocked` with the reason `no implemented tests`.
+- If execution fails due to a runtime error not caused by the application,
+  the execution stage records the failure and continues with remaining tests
+  where possible.
+- If Playwright spec generation fails, the execution stage records the failure
+  and the spec generation status as `blocked`.
+- If k6 is unavailable, the performance sub-stage is marked `blocked` with the
+  specific reason. No performance results are fabricated.
+- If execution is blocked by a safety gate, the stage marks the affected tests
+  as `blocked` with the safety constraint.
 
-**Human approval required:** Yes for any execution that the safety gates require explicit authorization for. No for read-only execution in allowed environments.
+**Human approval required:** Yes for any execution that the safety gates require
+explicit authorization for. No for read-only execution in allowed environments.
 
 **Handoff to Stage 11:**
-The orchestrator passes the execution run report and evidence index to the Failure Analysis stage. If there are no failures, the orchestrator may skip Stage 11 and proceed directly to Stage 12, recording that failure analysis was skipped because there were no failures.
+The orchestrator passes the execution run report, evidence index, network capture
+artifacts, request inventory, and performance artifacts (if any) to the Failure
+Analysis stage. If there are no failures, the orchestrator may skip Stage 11 and
+proceed directly to Stage 12, recording that failure analysis was skipped because
+there were no failures.
 
 ---
 
-### Stage 11 — Failure Analysis
+### Stage 11 — Failure Analysis (Cross-Stage)
 
 **Responsible:** Failure Analysis Agent (`agents/failure-analysis/AGENT.md`)
 
 **Required inputs:**
 - The execution run report.
 - The evidence index.
+- The network capture artifacts (if any).
+- The request inventory (if any).
+- The performance artifacts (if any).
 - The test-design output.
 - The specification output.
 - The project adapter.
@@ -625,37 +874,256 @@ The orchestrator passes the execution run report and evidence index to the Failu
 - `shared-state/<story-id>/test-design/output.md`
 - `shared-state/<story-id>/specification/output.md`
 - `projects/<project-name>/project.yaml`
+- All execution/performance artifacts as applicable.
 
 **Expected output:**
-- Number of failures analyzed.
-- Classification counts by category: product defect, test defect, environment issue, data issue, infrastructure issue, unknown.
-- Per-failure detail with evidence, reasoning, and alternative explanations.
+- Number of failures analyzed (including non-test failures).
+- Classification counts by category: product defect, test defect, environment
+  issue, data issue, infrastructure issue, parsing error, data integrity,
+  requirement gap, automation failure, network failure, performance failure,
+  artifact failure, configuration failure, dependency failure, unknown.
+- Per-failure detail with evidence, reasoning, root cause assessment, and
+  alternative explanations.
 - Failures that could not be classified and what is missing.
+- Impact chain for cross-stage failures.
 
 **Shared-state output:**
-- `shared-state/<story-id>/failure-analysis/classifications.md`
-- `shared-state/<story-id>/failure-analysis/failure-details.md`
-- `shared-state/<story-id>/failure-analysis/unknowns.md`
-- `shared-state/<story-id>/failure-analysis/assumptions.md`
+- `shared-state/<story-id>/failure-analysis/failure-analysis.md`
+- `shared-state/<story-id>/failure-analysis/issues.json`
 
 **Preconditions:**
 - Stage 10 is `completed`.
-- At least one failure exists to analyze, or the stage is skipped with a recorded reason.
+- At least one failure, blocker, or unexpected result exists to analyze, or
+  the stage is skipped with a recorded reason.
 
-**Validation checks:**
-- Every classification is supported by evidence.
-- No failure is classified as a product defect unless the expected behavior is confirmed from the project adapter or shared state.
-- No failure is classified as a test defect without identifying the specific test defect.
-- Unknown classifications record what additional information would be needed.
+**Failure Analysis is MANDATORY and is NOT limited to failed automated tests.**
+
+It is a cross-stage failure investigation capability. Any meaningful failure,
+unexpected result, blocker, execution error, data-integrity issue, validation
+mismatch, environment problem, or quality issue detected anywhere in the
+workflow is eligible for Failure Analysis.
+
+**Trigger sources (any stage):**
+
+Failures originating from any stage are eligible:
+1. Story Intake — story cannot be parsed, missing required sections.
+2. Discovery — cannot inspect target, target repository missing.
+3. Requirement Analysis — requirement conflict, missing critical information.
+4. QA Grill — ambiguity that blocks specification.
+5. Risk Analysis — risk that blocks testing.
+6. Test Architecture — architecture cannot be produced.
+7. QA Specification — specification incomplete or blocked.
+8. Test Design — scenarios cannot be designed.
+9. Specialist Delegation — no specialist available for a scenario.
+10. Test Execution — Playwright test fails, API returns unexpected status,
+    spec generation fails, network capture fails, request inventory generation
+    fails, k6 execution fails.
+11. Performance Testing — k6 script generation fails, k6 execution fails,
+    latency exceeds configured threshold, error rate increases under load,
+    stress test causes environment unavailability.
+12. Independent QA Review — artifact mismatch, missing coverage, unsupported
+    assumption detected.
+13. Evidence Collection — evidence incomplete or corrupted.
+14. Final QA Report — downstream artifact contradicts upstream artifact.
+
+**Examples of eligible failures:**
+- Story cannot be parsed.
+- Required section is missing from a stage output.
+- Discovery cannot inspect target repository.
+- Requirement conflict detected between stages.
+- Hardcoded information contaminates another story's artifacts.
+- Required environment unavailable.
+- Test generation fails (spec file not created).
+- Playwright test fails.
+- API returns unexpected status code.
+- Network request missing from capture.
+- Performance test fails (k6 error, threshold exceeded).
+- Latency exceeds configured threshold.
+- Error rate increases under load.
+- Evidence is incomplete.
+- Downstream artifact contradicts upstream artifact.
+- A stage produces invalid or inconsistent output.
+- Stale state detected (artifacts from a previous run reused).
+- Incorrect stage status recorded.
+- Incorrect routing (stage executed out of order).
+
+**Failure Analysis Artifact Structure:**
+
+For every detected issue, create a structured record:
+
+```
+Issue ID       — e.g. FA-001
+Source Stage   — e.g. Test Execution, Performance Testing, Discovery
+Failure Type   — one of:
+                   parsing_error, data_integrity, requirement_gap,
+                   execution_failure, environment_blocker,
+                   automation_failure, network_failure,
+                   performance_failure, artifact_failure,
+                   configuration_failure, dependency_failure, unknown
+What Failed    — exactly what failed. Do not generalize.
+Expected       — what the workflow was expected to produce/do.
+Actual         — what actually happened.
+Evidence       — reference actual available evidence (artifact path, test
+                   output, Playwright error, HTTP response, k6 output,
+                   performance metric, stage state, log, screenshot, HAR,
+                   report). Do NOT fabricate evidence.
+Root Cause     — exactly one of: Confirmed | Probable | Unknown
+                   (never invent a root cause)
+```
+
+**Root Cause Rules:**
+
+Distinguish Observed from Root Cause.
+
+Observed: "Playwright spec was generated but execution failed with 'no tests found'."
+
+Root Cause (only if implementation/evidence proves it):
+"Test-design scenarios did not map to any existing test file in the target repository."
+
+If evidence only shows symptom:
+Root Cause: Unknown — insufficient evidence.
+
+Then provide:
+Recommended Investigation:
+  1. Inspect the generated spec file.
+  2. Inspect the target repository's test directory.
+  3. Compare scenario IDs to test file names.
+  4. Reproduce the execution.
+  5. Identify the responsible component.
+
+**Impact:**
+
+For every issue, explain impact. Examples:
+- Downstream stage received incomplete requirements.
+- Test generation became unreliable.
+- Execution could not start.
+- Performance testing could not proceed.
+- Result cannot be considered valid.
+- Regression confidence is reduced.
+- Artifact cannot be trusted.
+
+Do NOT exaggerate impact.
+
+**Recommended Solution:**
+
+Must be based on evidence. Examples:
+- If parser confirmed as cause: Fix parser to recognize supported Markdown
+  heading structure and add regression coverage.
+- If environment missing: Configure an approved non-production test environment
+  and required credentials.
+- If k6 unavailable: Install k6 with explicit project permission, or accept
+  performance testing as blocked until k6 is available.
+- If root cause unknown: Collect missing evidence before changing implementation.
+
+Do NOT recommend changing timeouts, retry counts, or test logic merely to make
+a failure disappear.
+
+**Retest / Verification:**
+
+Every actionable failure must include a verification plan:
+
+Retest:
+  1. Apply proposed fix.
+  2. Delete/reset affected stage state if required.
+  3. Re-run affected stage.
+  4. Verify original failure no longer occurs.
+  5. Re-run directly dependent downstream stages.
+  6. Confirm no regression in a second story where practical.
+
+Failure Analysis must NOT mark an issue resolved merely because a proposed fix
+exists.
+
+**Issue Lifecycle:**
+
+Supported states:
+`detected | investigating | blocked | fix_proposed | fixed |
+retest_required | verified | unresolved`
+
+A failure must NOT become "verified" without actual verification evidence.
+
+**Cross-Stage Propagation:**
+
+If a failure affects downstream stages, record the dependency chain.
+
+Example:
+
+```
+FA-001
+Source: Test Execution (spec generation)
+Failure Type: automation_failure
+What Failed: Playwright spec file was not generated for story STORY-BASIC-001
+Expected:   Executable spec at shared-state/STORY-BASIC-001/execution/spec/STORY-BASIC-001.spec.js
+Actual:    Spec generation returned blocked — no scenarios could be extracted
+           from test-design/output.md
+Evidence:  shared-state/STORY-BASIC-001/test-design/output.md
+           (scenario table missing or unparseable)
+Root Cause: Unknown — insufficient evidence to determine why scenarios
+           could not be extracted
+Impact chain:
+  Test Design
+    ↓
+  incomplete scenario list
+    ↓
+  Spec Generation
+    ↓
+  no executable spec
+    ↓
+  Playwright Execution blocked
+    ↓
+  Network capture not attempted
+    ↓
+  Performance testing blocked
+
+Recommended Investigation:
+  1. Inspect test-design/output.md format.
+  2. Inspect the spec generation helper's scenario parsing logic.
+  3. Determine whether the scenario table format changed.
+  4. Reproduce the spec generation with the same inputs.
+```
+
+The first observed failure may not be the final visible symptom.
+
+**Classification counts:**
+
+Failure Analysis produces classification counts across all categories,
+not just product defects and test defects:
+
+| Category | Count | Notes |
+|----------|-------|-------|
+| Product defect | N | Application behavior does not match expected |
+| Test defect | N | Test or automation has a bug |
+| Environment issue | N | Target environment problem |
+| Data issue | N | Test data or precondition problem |
+| Infrastructure issue | N | CI, tooling, or platform problem |
+| Parsing error | N | Stage output could not be parsed |
+| Data integrity | N | Artifact mismatch or corruption |
+| Requirement gap | N | Required information missing from requirement |
+| Automation failure | N | Test generation or execution failure |
+| Network failure | N | Network capture or API communication failure |
+| Performance failure | N | k6 execution failure or threshold exceeded |
+| Artifact failure | N | Stage produced invalid/inconsistent output |
+| Configuration failure | N | Project adapter misconfigured |
+| Dependency failure | N | Required tool or dependency unavailable |
+| Unknown | N | Cannot classify with available evidence |
 
 **Failure behavior:**
-- If a failure cannot be classified, it is marked `unknown` with the missing information recorded. The workflow does not stop on an unknown classification.
-- If failure analysis itself fails, the stage is marked `failed` with the reason, and the orchestrator records that failure analysis was incomplete. The workflow continues to Review, which treats the missing analysis as a finding.
+- If a failure cannot be classified, it is marked `unknown` with the missing
+  information recorded. The workflow does not stop on an unknown classification.
+- If failure analysis itself fails, the stage is marked `failed` with the
+  reason, and the orchestrator records that failure analysis was incomplete.
+  The workflow continues to Review, which treats the missing analysis as a
+  finding.
+- If no failures exist from any stage, the stage is skipped with a recorded
+  reason.
 
-**Human approval required:** No. Failure analysis is diagnostic. Human action may be needed to resolve a product defect or environment issue, but that is outside the workflow's control.
+**Human approval required:** No. Failure analysis is diagnostic. Human action
+may be needed to resolve a product defect or environment issue, but that is
+outside the workflow's control.
 
 **Handoff to Stage 12:**
-The orchestrator passes the failure-analysis output to the Review stage. If failure analysis was skipped, the orchestrator passes a note that no failures were present.
+The orchestrator passes the failure-analysis output to the Review stage. If
+failure analysis was skipped, the orchestrator passes a note that no failures
+were present across any stage.
 
 ---
 
@@ -825,21 +1293,21 @@ There is no further stage. The workflow ends. The orchestrator sets the overall 
 
 ## Handoff Summary
 
-| From | To | Handoff contents |
-|---|---|---|
-| Story Intake | Project Discovery | Story, acceptance criteria, story-id |
-| Project Discovery | Requirement Analysis | Discovery report, project identifier, story-id |
-| Requirement Analysis | QA Grill | Analysis output, discovery report, story-id |
-| QA Grill | Risk Analysis | Grill output, analysis output, discovery report, story-id |
-| Risk Analysis | Test Architecture | Risk output, grill output, analysis output, discovery report, story-id |
-| Test Architecture | QA Specification | Architecture output, risk output, grill output, analysis output, discovery report, story-id |
-| QA Specification | Test Design | Specification output, grill output, architecture output, discovery report, story-id |
-| Test Design | Specialist Delegation | Test-design output, architecture output, discovery report, project adapter, story-id |
-| Specialist Delegation | Test Execution | Delegation records, implemented tests, project adapter, story-id |
-| Test Execution | Failure Analysis | Execution run report, evidence index, test-design output, specification output, project adapter, story-id |
-| Failure Analysis | Independent QA Review | Failure-analysis output, execution run report, evidence index, all prior outputs, project adapter, story-id |
-| Independent QA Review | Evidence Collection | Review output, execution run report, evidence index, failure-analysis output, project adapter, story-id |
-| Evidence Collection | Final QA Report | Consolidated evidence package, all prior outputs, project adapter, story-id |
+|| From | To | Handoff contents |
+||---|---|---|
+|| Story Intake | Project Discovery | Story, acceptance criteria, story-id |
+|| Project Discovery | Requirement Analysis | Discovery report, project identifier, story-id |
+|| Requirement Analysis | QA Grill | Analysis output, discovery report, story-id |
+|| QA Grill | Risk Analysis | Grill output, analysis output, discovery report, story-id |
+|| Risk Analysis | Test Architecture | Risk output, grill output, analysis output, discovery report, story-id |
+|| Test Architecture | QA Specification | Architecture output, risk output, grill output, analysis output, discovery report, story-id |
+|| QA Specification | Test Design | Specification output, grill output, architecture output, discovery report, story-id |
+|| Test Design | Specialist Delegation | Test-design output, architecture output, discovery report, project adapter, story-id |
+|| Specialist Delegation | Test Execution | Delegation records, test-design output, project adapter, story-id |
+|| Test Execution | Failure Analysis | Execution run report, evidence index, network artifacts, request inventory, performance artifacts, test-design output, specification output, project adapter, story-id |
+|| Failure Analysis | Independent QA Review | Failure-analysis output, execution run report, evidence index, all prior outputs, project adapter, story-id |
+|| Independent QA Review | Evidence Collection | Review output, execution run report, evidence index, failure-analysis output, project adapter, story-id |
+|| Evidence Collection | Final QA Report | Consolidated evidence package, all prior outputs, project adapter, story-id |
 
 ## Error and Block Behavior
 

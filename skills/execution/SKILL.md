@@ -1,206 +1,932 @@
 ===
-Lowest layer: runs tests, collects results, captures exit code, stdout, stderr, evidence.
-
-Deps: hypothesis (generative data), pytest or stdlib unittest for assertions.
+Execution Skill — generates executable test specs, runs them, captures network,
+classifies requests, and prepares performance testing.
+Deps: Python stdlib (json, subprocess, pathlib, re).
 ===
 
-import subprocess
 import json
 import os
+import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def run_command(cmd, cwd=None, env=None, timeout=300):
-    """Run a command and capture exit code, stdout, stderr."""
-    proc = subprocess.run(
-        cmd,
-        cwd=cwd,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
+def ensure_dir(path: str) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+# ── Playwright Spec Generation ──────────────────────────────────────────────
+
+
+def generate_playwright_spec(
+    story_id: str,
+    scenarios: list[dict],
+    base_url: str | None,
+    output_dir: str,
+) -> dict:
+    """Generate an executable Playwright spec file from test-design scenarios.
+
+    Args:
+        story_id: the story identifier.
+        scenarios: list of scenario dicts from test-design/output.md.
+                   Each should have at minimum: id, name, level, description.
+        base_url: the application base URL (None if unavailable — marks blocker).
+        output_dir: directory under which to write shared-state/<story>/execution/spec/.
+
+    Returns:
+        dict with keys: spec_path, spec_file, status, blocker, scenario_count.
+    """
+    har = Path(output_dir)
+    spec_dir = ensure_dir(str(har / story_id / "execution" / "spec"))
+    spec_path = spec_dir / f"{story_id}.spec.js"
+    blocker = None
+
+    if not base_url:
+        blocker = "BASE_URL_UNAVAILABLE"
+
+    scenario_count = len(scenarios)
+
+    # Build test blocks from scenarios
+    test_blocks = []
+    for sc in scenarios:
+        sid = sc.get("id", "SCENARIO")
+        sname = sc.get("name", "Unknown Scenario")
+        level = sc.get("level", "E2E")
+        desc = sc.get("description", sname)
+
+        # Sanitize test name for Playwright (remove problematic chars)
+        safe_name = re.sub(r"[^\w\s-]", "", sname).strip()[:60]
+
+        if level and "API" in level:
+            # API-level test
+            test_blocks.append({
+                "type": "api",
+                "name": safe_name,
+                "id": sid,
+                "desc": desc,
+            })
+        else:
+            # E2E/UI-level test
+            test_blocks.append({
+                "type": "e2e",
+                "name": safe_name,
+                "id": sid,
+                "desc": desc,
+            })
+
+    # Write the spec file
+    spec_content = _build_spec_content(story_id, test_blocks, base_url, blocker)
+    spec_path.write_text(spec_content)
+
     return {
-        "exit_code": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
-        "timed_out": False,
+        "spec_path": str(spec_path),
+        "spec_file": f"shared-state/{story_id}/execution/spec/{story_id}.spec.js",
+        "status": "generated",
+        "blocker": blocker,
+        "scenario_count": scenario_count,
+        "test_blocks": test_blocks,
     }
 
 
-def run_with_timeout(cmd, cwd=None, env=None, timeout=300):
-    """Run a command with timeout handling."""
-    try:
-        return run_command(cmd, cwd, env, timeout)
-    except subprocess.TimeoutExpired as e:
-        return {
-            "exit_code": -1,
-            "stdout": e.stdout or "",
-            "stderr": e.stderr or "",
-            "timed_out": True,
-        }
-
-
-def collect_evidence(run_result, story_id, output_dir):
-    """Collect evidence from a test run."""
-    evidence = {
-        "timestamp": now_iso(),
-        "exit_code": run_result["exit_code"],
-        "timed_out": run_result["timed_out"],
-        "stdout": run_result["stdout"][:10000] if run_result["stdout"] else "",
-        "stderr": run_result["stderr"][:10000] if run_result["stderr"] else "",
-    }
-    
-    evidence_dir = Path(output_dir) / story_id / "execution"
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    
-    evidence_file = evidence_dir / "run-evidence.json"
-    with open(evidence_file, "w") as f:
-        json.dump(evidence, f, indent=2)
-    
-    return str(evidence_file)
-
-
-def parse_test_results(output, result_format="junit"):
-    """Parse test output into structured results."""
-    if result_format == "junit" and output:
-        # Basic JUnit-style parsing
-        results = {
-            "total": 0,
-            "passed": 0,
-            "failed": 0,
-            "errors": 0,
-            "skipped": 0,
-        }
-        for line in output.splitlines():
-            if "Tests run:" in line:
-                import re
-                match = re.search(r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", line)
-                if match:
-                    results["total"] = int(match.group(1))
-                    results["failed"] = int(match.group(2))
-                    results["errors"] = int(match.group(3))
-                    results["skipped"] = int(match.group(4))
-                    results["passed"] = results["total"] - results["failed"] - results["errors"] - results["skipped"]
-        return results
-    return {"raw": output[:5000] if output else ""}
-
-
-def generate_run_report(story_id, tests_run, results, blocked, evidence_files, env_info):
-    """Generate execution run report."""
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    
+def _build_spec_content(story_id, test_blocks, base_url, blocker):
+    """Build the JavaScript content for the Playwright spec file."""
     lines = [
-        f"# Test Execution — {story_id}",
-        "",
-        f"**Project:** (from project adapter)",
-        "**Source inputs:** delegation/output.md, project.yaml",
-        f"**Execution timestamp:** {now}",
-        "",
-        "---",
-        "",
-        "## 1. Execution Summary",
-        "",
-        f"**Status:** {'EXECUTED' if tests_run else 'BLOCKED'}",
-        "",
-        "## 2. Tests Run",
+        "// ================================================================",
+        f"// Playwright Test Spec — {story_id}",
+        "// ================================================================",
+        "//",
+        "// AUTO-GENERATED by QA Agent Harness execution skill.",
+        "// This file is a real executable Playwright test specification.",
+        "// It is saved to shared-state/<story>/execution/spec/",
+        "//",
+        "// NOTE: Selectors, URLs, and test data are PLACEHOLDERS.",
+        "// They must be replaced with actual project values before",
+        "// this spec can produce meaningful results.",
+        "//",
+        "// Network capture is enabled via Playwright request/response",
+        "// events. Captured data is written to",
+        "// shared-state/<story>/execution/network/",
+        "//",
+        "// ================================================================",
         "",
     ]
-    
-    if tests_run:
-        lines.append(f"**Number of tests run:** {len(tests_run)}")
-        for test in tests_run:
-            status = "PASS" if test.get("passed") else "FAIL" if test.get("failed") else "SKIPPED"
-            lines.append(f"- {test['name']}: {status}")
+
+    # Base URL handling
+    if blocker == "BASE_URL_UNAVAILABLE":
+        lines.extend([
+            "// *** BLOCKER: Base URL is not available. ***",
+            "// This spec cannot be executed until a base URL is configured",
+            "// in the project adapter or supplied at runtime.",
+            'const BASE_URL = process.env.BASE_URL || "REPLACE_WITH_ACTUAL_BASE_URL";',
+            "",
+        ])
     else:
-        lines.append("_(No tests were executed.)_")
-    
+        lines.extend([
+            'const BASE_URL = process.env.BASE_URL || "REPLACE_WITH_ACTUAL_BASE_URL";',
+            "",
+        ])
+
+    # Network capture setup
+    lines.extend([
+        "// ---------------------------------------------------------------",
+        "// Network capture configuration",
+        "// ---------------------------------------------------------------",
+        "const NETWORK_CAPTURE_enabled = true;",
+        "",
+        "function setupNetworkCapture(context) {",
+        "  const requests = [];",
+        "  const responses = [];",
+        "",
+        "  context.on('request', (request) => {",
+        "    requests.push({",
+        "      url: request.url(),",
+        "      method: request.method(),",
+        "      resourceType: request.resourceType(),",
+        "      timestamp: Date.now(),",
+        "      headers: captureSafeHeaders(request.headers()),",
+        "    });",
+        "  });",
+        "",
+        "  context.on('response', (response) => {",
+        "    const req = response.request();",
+        "    responses.push({",
+        "      url: response.url(),",
+        "      method: req.method(),",
+        "      resourceType: response.request().resourceType(),",
+        "      status: response.status(),",
+        "      requestTimestamp: requests.find(r =>",
+        "        r.url === response.url() && r.method === req.method())?.timestamp",
+        "        || Date.now(),",
+        "      responseTimestamp: Date.now(),",
+        "      headers: captureSafeHeaders(response.headers()),",
+        "      bodySize: response.body().then(b => b.length).catch(() => 0),",
+        "    });",
+        "  });",
+        "",
+        "  return { requests, responses };",
+        "}",
+        "",
+        "function captureSafeHeaders(headers) {",
+        "  // Sanitize sensitive headers before capture",
+        "  const safe = {};",
+        "  const sensitive = [",
+        "    'authorization', 'cookie', 'set-cookie', 'proxy-authorization',",
+        "    'x-api-key', 'x-auth-token', 'x-session-token',",
+        "  ];",
+        "  for (const [key, value] of headers.entries()) {",
+        "    const lower = key.toLowerCase();",
+        "    if (sensitive.some(s => lower.includes(s))) {",
+        "      safe[key] = '<REDACTED>';",
+        "    } else {",
+        "      safe[key] = value;",
+        "    }",
+        "  }",
+        "  return safe;",
+        "}",
+        "",
+        "function saveNetworkCapture(requests, responses, outputDir) {",
+        "  const fs = require('fs');",
+        "  const path = require('path');",
+        "  const dir = path.join(outputDir, 'network');",
+        "  fs.mkdirSync(dir, { recursive: true });",
+        "",
+        "  const capture = {",
+        "    storyId: process.env.STORY_ID || 'unknown',",
+        "    capturedAt: new Date().toISOString(),",
+        "    requests: requests.map(r => ({",
+        "      url: sanitizeUrl(r.url),",
+        "      method: r.method,",
+        "      resourceType: r.resourceType,",
+        "      headers: r.headers,",
+        "      timestamp: r.timestamp,",
+        "    })),",
+        "    responses: responses.map(r => ({",
+        "      url: sanitizeUrl(r.url),",
+        "      method: r.method,",
+        "      resourceType: r.resourceType,",
+        "      status: r.status,",
+        "      requestTimestamp: r.requestTimestamp,",
+        "      responseTimestamp: r.responseTimestamp,",
+        "      headers: r.headers,",
+        "    })),",
+        "  };",
+        "",
+        "  fs.writeFileSync(",
+        "    path.join(dir, 'network-requests.json'),",
+        "    JSON.stringify(capture, null, 2)",
+        "  );",
+        "}",
+        "",
+        "function sanitizeUrl(url) {",
+        "  // Remove tokens and sensitive query params from URLs",
+        "  try {",
+        "    const u = new URL(url);",
+        "    const sensitiveParams = [",
+        "      'token', 'access_token', 'auth', 'session', 'sig',",
+        "      'apikey', 'api_key', 'key', 'secret', 'password',",
+        "    ];",
+        "    for (const param of sensitiveParams) {",
+        "      if (u.searchParams.has(param)) {",
+        "        u.searchParams.set(param, '<REDACTED>');",
+        "      }",
+        "    }",
+        "    return u.toString();",
+        "  } catch {",
+        "    return url;",
+        "  }",
+        "}",
+        "",
+        "// ---------------------------------------------------------------",
+        "// Test fixtures and helpers",
+        "// ---------------------------------------------------------------",
+        "const { test: pw_test, expect } = require('@playwright/test');",
+        "",
+        "pw_test.step('setup network capture', async ({ context }) => {",
+        "  if (NETWORK_CAPTURE_ENABLED) {",
+        "    global.__networkCapture = setupNetworkCapture(context);",
+        "  }",
+        "});",
+        "",
+    ]
+
+    # Generate test blocks
+    for block in test_blocks:
+        safe_name = block["name"]
+        sid = block["id"]
+        desc = block["desc"]
+        is_api = block["type"] == "api"
+
+        lines.extend([
+            "",
+            f"// Test: {safe_name} ({sid})",
+            f"// Description: {desc}",
+            f"// Type: {'API' if is_api else 'E2E'}",
+            "",
+        ])
+
+        if is_api:
+            lines.extend([
+                f"pw_test(f'API: {safe_name}', async () => {{",
+                f"  // TODO: Replace with actual API endpoint and request data",
+                f"  // Endpoint: REPLACE_WITH_ACTUAL_ENDPOINT",
+                f"  // Method: REPLACE_WITH_ACTUAL_METHOD",
+                f"  // Body: REPLACE_WITH_ACTUAL_BODY_IF_NEEDED",
+                f"  //",
+                f"  // This is a placeholder API test. The actual endpoint,",
+                f"  // request method, headers, and body must be supplied",
+                f"  // from the project adapter or test design.",
+                f"  throw new Error('API test placeholder — endpoint not specified');",
+                "});",
+            ])
+        else:
+            lines.extend([
+                f"pw_test(f'E2E: {safe_name}', async ({{ page }}) => {{",
+                f"  // TODO: Replace with actual selectors and navigation",
+                f"  // Entry URL: BASE_URL + REPLACE_WITH_ACTUAL_PATH",
+                f"  // Selectors: REPLACE_WITH_ACTUAL_SELECTORS",
+                f"  //",
+                f"  // This is a placeholder E2E test. The actual page URL,",
+                f"  // selectors, input values, and expected outcomes must",
+                f"  // be supplied from the project adapter or test design.",
+                f"  throw new Error('E2E test placeholder — selectors not specified');",
+                "});",
+            ])
+
     lines.extend([
         "",
-        "## 3. Results Summary",
+        "// ---------------------------------------------------------------",
+        "// Cleanup: save network capture after all tests",
+        "// ---------------------------------------------------------------",
+        "pw_test.afterAll(async () => {",
+        "  if (NETWORK_CAPTURE_ENABLED && global.__networkCapture) {",
+        "    const outputDir = process.env.OUTPUT_DIR || '.';",
+        "    saveNetworkCapture(",
+        "      global.__networkCapture.requests,",
+        "      global.__networkCapture.responses,",
+        "      outputDir",
+        "    );",
+        "    console.log('Network capture saved to', outputDir + '/network/');",
+        "  }",
+        "});",
         "",
+        "// ================================================================",
+        f"// End of {story_id}.spec.js",
+        "// ================================================================",
     ])
-    
-    if results:
-        lines.append(f"- Total: {results.get('total', 0)}")
-        lines.append(f"- Passed: {results.get('passed', 0)}")
-        lines.append(f"- Failed: {results.get('failed', 0)}")
-        lines.append(f"- Errors: {results.get('errors', 0)}")
-        lines.append(f"- Skipped: {results.get('skipped', 0)}")
-    else:
-        lines.append("_(No results available.)_")
-    
-    lines.extend([
-        "",
-        "## 4. Blocked Tests",
-        "",
-    ])
-    
-    if blocked:
-        for b in blocked:
-            lines.append(f"- {b}")
-    else:
-        lines.append("_(No tests were blocked.)_")
-    
-    lines.extend([
-        "",
-        "## 5. Environment",
-        "",
-        f"- Environment: {env_info.get('name', 'Not specified')}",
-        f"- Framework: {env_info.get('framework', 'Not specified')}",
-        f"- Language: {env_info.get('language', 'Not specified')}",
-        "",
-        "## 6. Evidence Index",
-        "",
-    ])
-    
-    if evidence_files:
-        for ef in evidence_files:
-            lines.append(f"- {ef}")
-    else:
-        lines.append("_(No evidence collected.)_")
-    
-    lines.extend([
-        "",
-        "---",
-        "",
-        f"*Test execution performed by qa-run runtime. Results are captured from actual test runs. No results were invented.*",
-    ])
-    
+
     return "\n".join(lines)
 
 
-def is_environment_available(project_config):
-    """Check if a test environment is available."""
-    env = project_config.get("environments", {})
-    return any(env.get(k) for k in ("dev", "staging", "production"))
+# ── Request Classification ───────────────────────────────────────────────────
 
 
-def check_safety_gates(project_config, action_type):
-    """Check if action is permitted by safety gates."""
-    safety = project_config.get("safety", {})
-    
-    if action_type == "production_execution" and not safety.get("production_execution", False):
-        return False, "production_execution is disabled"
-    if action_type == "real_payments" and not safety.get("real_payments", False):
-        return False, "real_payments is disabled"
-    if action_type == "destructive_db" and not safety.get("destructive_database_operations", False):
-        return False, "destructive_database_operations is disabled"
-    
-    return True, "permitted"
+def classify_request(url: str, method: str, resource_type: str) -> dict:
+    """Classify a captured request into a performance category.
+
+    Args:
+        url: sanitized URL.
+        method: HTTP method.
+        resource_type: Playwright resource type (document, xhr, fetch,
+                       stylesheet, script, image, font, etc.).
+
+    Returns:
+        dict with: category, selected_for_performance, reason.
+    """
+    url_lower = url.lower()
+    rt = resource_type.lower()
+
+    # Static assets — always exclude
+    if rt in ("stylesheet", "script", "image", "font", "media", "manifest",
+              "xhr" if "static" in url_lower else None):
+        if rt in ("stylesheet", "script", "image", "font", "media", "manifest"):
+            return {
+                "category": "static_asset",
+                "selected_for_performance": False,
+                "reason": f"Static asset (resource type: {resource_type})",
+            }
+
+    # Analytics/telemetry
+    analytics_patterns = [
+        "google-analytics", "googletagmanager", "gtag", "analytics.js",
+        "omniture", "hotjar", "mixpanel", "segment.io", "segment.com",
+        "newrelic", "datadog", "sentry", "error-tracking",
+    ]
+    if any(p in url_lower for p in analytics_patterns):
+        return {
+            "category": "analytics",
+            "selected_for_performance": False,
+            "reason": "Analytics/telemetry — excluded from performance testing",
+        }
+
+    # Third-party domains
+    third_party_domains = [
+        "google.com", "googletagmanager.com", "facebook.net", "facebook.com",
+        "twitter.com", "linkedin.com", "youtube.com", "vimeo.com",
+        "amazonaws.com", "cloudflare", "akamai", "cdn.", "doubleclick",
+    ]
+    host = url.split("/")[2] if len(url.split("/")) > 2 else ""
+    if any(tp in host for tp in third_party_domains):
+        return {
+            "category": "third_party",
+            "selected_for_performance": False,
+            "reason": f"Third-party domain ({host}) — excluded",
+        }
+
+    # Browser internal
+    browser_internal = [
+        "chrome-extension", "moz-extension", "opera-extension",
+        "internal", "about:", "data:",
+    ]
+    if any(bi in url_lower for bi in browser_internal):
+        return {
+            "category": "browser_internal",
+            "selected_for_performance": False,
+            "reason": "Browser-internal request — excluded",
+        }
+
+    # Authentication endpoints
+    auth_patterns = [
+        "/login", "/auth", "/token", "/oauth", "/session",
+        "/authenticate", "/authorize", "/identity",
+    ]
+    if any(ap in url_lower for ap in auth_patterns):
+        return {
+            "category": "authentication",
+            "selected_for_performance": True,  # Eligible — selected by default
+            "reason": "Authentication endpoint — eligible for performance testing",
+        }
+
+    # Business API (XHR/Fetch with API-like paths)
+    if rt in ("xhr", "fetch", "document") or method in ("POST", "PUT", "DELETE", "PATCH"):
+        return {
+            "category": "business_api",
+            "selected_for_performance": True,
+            "reason": "Business/application API request — primary performance target",
+        }
+
+    # Document/page loads
+    if rt == "document":
+        return {
+            "category": "business_api",
+            "selected_for_performance": True,
+            "reason": "Page/document load — eligible for performance testing",
+        }
+
+    # Default
+    return {
+        "category": "unknown",
+        "selected_for_performance": False,
+        "reason": "Cannot classify — manual review required",
+    }
 
 
-def should_execute(project_config, story_id):
-    """Determine if execution should proceed."""
-    if not is_environment_available(project_config):
-        return False, "No test environment enabled"
-    
-    # Check if there are implemented tests
-    # This would check the project directory for test files
-    return True, "ready"
+# ── Request Inventory Generation ────────────────────────────────────────────
+
+
+def generate_request_inventory(
+    network_requests: list[dict],
+    network_responses: list[dict],
+    output_path: str,
+) -> dict:
+    """Generate a request inventory from captured network data.
+
+    Args:
+        network_requests: list of captured request dicts.
+        network_responses: list of captured response dicts.
+        output_path: path to write the inventory JSON.
+
+    Returns:
+        dict with inventory metadata and request count.
+    """
+    ensure_dir(str(Path(output_path).parent))
+
+    inventory = []
+    for req in network_requests:
+        url = req.get("url", "")
+        method = req.get("method", "GET")
+        rt = req.get("resourceType", "unknown")
+
+        classification = classify_request(url, method, rt)
+
+        # Merge with response data if available
+        resp = next(
+            (r for r in network_responses
+             if r.get("url") == url and r.get("method") == method),
+            None
+        )
+
+        entry = {
+            "method": method,
+            "sanitized_url": url,
+            "resource_type": rt,
+            "category": classification["category"],
+            "selected_for_performance": classification["selected_for_performance"],
+            "reason": classification["reason"],
+            "source_artifact": "shared-state/<story>/execution/network/network-requests.json",
+            "response_status": resp.get("status") if resp else None,
+            "response_time_ms": (
+                resp.get("responseTimestamp", 0) - req.get("timestamp", 0)
+                if resp and req.get("timestamp")
+                else None
+            ),
+        }
+        inventory.append(entry)
+
+    output = {
+        "generated_at": now_iso(),
+        "total_requests": len(inventory),
+        "selected_requests": sum(1 for e in inventory if e["selected_for_performance"]),
+        "requests": inventory,
+    }
+
+    with open(output_path, "w") as f:
+        json.dump(output, f, indent=2)
+
+    return output
+
+
+# ── k6 Script Generation ─────────────────────────────────────────────────────
+
+
+def generate_k6_scripts(
+    inventory: dict,
+    output_dir: str,
+    story_id: str,
+) -> dict:
+    """Generate k6 load-test and stress-test scripts from request inventory.
+
+    Args:
+        inventory: request inventory dict (from generate_request_inventory).
+        output_dir: base output directory.
+        story_id: story identifier.
+
+    Returns:
+        dict with paths to generated scripts and blocked requests.
+    """
+    har = Path(output_dir)
+    perf_dir = ensure_dir(str(har / story_id / "performance"))
+    selected = [r for r in inventory.get("requests", []) if r["selected_for_performance"]]
+
+    blocked_requests = []
+    load_scenarios = []
+    stress_scenarios = []
+
+    for req in selected:
+        url = req["sanitized_url"]
+        method = req["method"]
+
+        # Check if we have enough info to generate a k6 scenario
+        if not url or url == "REPLACE_WITH_ACTUAL_BASE_URL" or "REPLACE_WITH_ACTUAL" in url:
+            blocked_requests.append({
+                "url": url,
+                "method": method,
+                "reason": "URL not available — cannot generate k6 scenario",
+            })
+            continue
+
+        scenario = {
+            "method": method,
+            "url": url,
+            "category": req["category"],
+        }
+        load_scenarios.append(scenario)
+        stress_scenarios.append(scenario)
+
+    # Generate load-test.js
+    load_script = _build_k6_load_script(story_id, load_scenarios, blocked_requests)
+    load_path = perf_dir / "load-test.js"
+    load_path.write_text(load_script)
+
+    # Generate stress-test.js
+    stress_script = _build_k6_stress_script(story_id, stress_scenarios, blocked_requests)
+    stress_path = perf_dir / "stress-test.js"
+    stress_path.write_text(stress_script)
+
+    return {
+        "load_test_path": str(load_path),
+        "stress_test_path": str(stress_path),
+        "selected_count": len(selected),
+        "blocked_requests": blocked_requests,
+        "load_scenarios": len(load_scenarios),
+        "stress_scenarios": len(stress_scenarios),
+    }
+
+
+def _build_k6_load_script(story_id, scenarios, blocked):
+    """Build k6 load test script content."""
+    lines = [
+        "// ================================================================",
+        f"// k6 Load Test — {story_id}",
+        "// ================================================================",
+        "//",
+        "// AUTO-GENERATED by QA Agent Harness performance testing skill.",
+        "// This file is a real executable k6 load test script.",
+        "//",
+        "// Configuration: adjust VUs, duration, and thresholds in the",
+        "// options block below. Do NOT run against production.",
+        "//",
+        "// NOTE: URLs are placeholders. Replace with actual project",
+        "// endpoints before execution.",
+        "//",
+        "// ================================================================",
+        "",
+        "import { check, sleep } from 'k6';",
+        "import http from 'k6/http';",
+        "import { Rate } from 'k6/metrics';",
+        "",
+        "// Custom metrics",
+        "const errorRate = new Rate('errors');",
+        "",
+        "// ---------------------------------------------------------------",
+        "// Configuration — adjust for your environment",
+        "// ---------------------------------------------------------------",
+        "const TARGET_BASE_URL = __ENV.TARGET_BASE_URL || 'REPLACE_WITH_ACTUAL_BASE_URL';",
+        "",
+        "export const options = {",
+        "  // Load test configuration",
+        "  stages: [",
+        "    { duration: '30s', target: 1 },   // Ramp up to 1 VU",
+        "    { duration: '60s', target: 5 },   // Ramp up to 5 VUs (load)",
+        "    { duration: '60s', target: 5 },   // Stay at 5 VUs (steady)",
+        "    { duration: '30s', target: 0 },   // Ramp down",
+        "  ],",
+        "  thresholds: {",
+        "    http_req_duration: ['p(95)<500'],  // 95% of requests < 500ms",
+        "    errorRate: ['rate<0.01'],           // Error rate < 1%",
+        "  },",
+        "};",
+        "",
+        "// ---------------------------------------------------------------",
+        "// Test scenarios — generated from request inventory",
+        "// ---------------------------------------------------------------",
+    ]
+
+    if not scenarios:
+        lines.append("// No scenarios available for load testing.")
+        lines.append("export default function () {")
+        lines.append("  console.log('No performance test scenarios configured.')")
+        lines.append("}")
+    else:
+        for i, sc in enumerate(scenarios):
+            safe_url = sc["url"].replace("'", "\\'")
+            method = sc["method"]
+            lines.extend([
+                f"// Scenario {i+1}: {method} {safe_url[:80]}",
+                f"function scenario_{i}()) {{",
+                f"  const url = TARGET_BASE_URL + '{safe_url}';",
+                f"  const params = {{ headers: {{ 'Content-Type': 'application/json' }} }};",
+                f"  const res = http.{method.lower()}(url, null, params);",
+                f"  check(res, {{",
+                f"    'status is 200': (r) => r.status === 200,",
+                f"  }}, {{
+                f"  errorRate.add(res.status !== 200);",
+                f"  sleep(1);",
+                f"}}",
+            ])
+
+        lines.extend([
+            "",
+            "export default function () {",
+        ])
+        for i in range(len(scenarios)):
+            lines.append(f"  scenario_{i}();")
+        lines.extend([
+            "  sleep(0.5);",
+            "}",
+        ])
+
+    lines.extend([
+        "",
+        "// ---------------------------------------------------------------",
+        "// Blocked scenarios",
+        "// ---------------------------------------------------------------",
+    ])
+    if blocked:
+        for b in blocked:
+            lines.append(f"// BLOCKED: {b['method']} {b['url'][:60]} — {b['reason']}")
+    else:
+        lines.append("// No blocked scenarios.")
+
+    lines.extend([
+        "",
+        "// ================================================================",
+        f"// End of {story_id} load-test.js",
+        "// ================================================================",
+    ])
+
+    return "\n".join(lines)
+
+
+def _build_k6_stress_script(story_id, scenarios, blocked):
+    """Build k6 stress test script content."""
+    lines = [
+        "// ================================================================",
+        f"// k6 Stress Test — {story_id}",
+        "// ================================================================",
+        "//",
+        "// AUTO-GENERATED by QA Agent Harness performance testing skill.",
+        "// Stress test progressively increases load to find degradation",
+        "// points. Do NOT run against production.",
+        "//",
+        "// ================================================================",
+        "",
+        "import { check } from 'k6';",
+        "import http from 'k6/http';",
+        "import { Trend } from 'k6/metrics';",
+        "",
+        "const latencyTrend = new Trend('latency');",
+        "",
+        "const TARGET_BASE_URL = __ENV.TARGET_BASE_URL || 'REPLACE_WITH_ACTUAL_BASE_URL';",
+        "",
+        "export const options = {",
+        "  stages: [",
+        "    { duration: '15s', target: 1 },",
+        "    { duration: '15s', target: 3 },",
+        "    { duration: '15s', target: 5 },",
+        "    { duration: '15s', target: 10 },",
+        "    { duration: '15s', target: 15 },",
+        "    { duration: '15s', target: 20 },",
+        "    { duration: '15s', target: 0 },",
+        "  ],",
+        "  thresholds: {",
+        "    http_req_duration: ['p(95)<1000'],  // Relaxed for stress test",
+        "    errorRate: ['rate<0.05'],           // Higher tolerance under stress",
+        "  },",
+        "};",
+        "",
+        "// Stress test scenarios",
+    ]
+
+    if not scenarios:
+        lines.append("// No scenarios available for stress testing.")
+        lines.append("export default function () {")
+        lines.append("  console.log('No stress test scenarios configured.')")
+        lines.append("}")
+    else:
+        for i, sc in enumerate(scenarios):
+            safe_url = sc["url"].replace("'", "\\'")
+            method = sc["method"]
+            lines.extend([
+                f"function stress_scenario_{i}() {{",
+                f"  const url = TARGET_BASE_URL + '{safe_url}';",
+                f"  const res = http.{method.lower()}(url);",
+                f"  check(res, {{ 'status is 2xx': (r) => r.status >= 200 && r.status < 300 }});",
+                f"  latencyTrend.add(res.timings.duration);",
+                f"  sleep(0.5);",
+                f"}}",
+            ])
+
+        lines.extend([
+            "",
+            "export default function () {",
+        ])
+        for i in range(len(scenarios)):
+            lines.append(f"  stress_scenario_{i}();")
+        lines.extend([
+            "}",
+        ])
+
+    lines.extend([
+        "",
+        "// Blocked scenarios",
+    ])
+    if blocked:
+        for b in blocked:
+            lines.append(f"// BLOCKED: {b['method']} {b['url'][:60]} — {b['reason']}")
+    else:
+        lines.append("// No blocked scenarios.")
+
+    lines.extend([
+        "",
+        "// ================================================================",
+        f"// End of {story_id} stress-test.js",
+        "// ================================================================",
+    ])
+
+    return "\n".join(lines)
+
+
+# ── Performance Result Parsing ───────────────────────────────────────────────
+
+
+def parse_k6_output(stdout: str) -> dict:
+    """Parse k6 stdout to extract key metrics.
+
+    Args:
+        stdout: raw k6 stdout text.
+
+    Returns:
+        dict with extracted metrics (best-effort parsing).
+    """
+    result = {
+        "scenarios": [],
+        "metrics": {
+            "http_req_duration": {},
+            "http_reqs": {},
+            "errors": {},
+            "iteration_duration": {},
+        },
+        "thresholds": {},
+        "status": "unknown",
+    }
+
+    # Check for failed thresholds
+    threshold_fail = re.findall(r"thresholds\s+failed:\s+(.+)", stdout)
+    if threshold_fail:
+        result["thresholds"]["failed"] = threshold_fail[0].strip()
+
+    threshold_pass = re.findall(r"thresholds\s+passed:\s+(.+)", stdout)
+    if threshold_pass:
+        result["thresholds"]["passed"] = threshold_pass[0].strip()
+
+    # Extract scenario results
+    scenario_pattern = re.findall(
+        r"\\s+\[(\d+\.\d{2}s)\]\s+(.+?)\s+(✓|✗|×)\s+(.+)", stdout
+    )
+    # Try alternative pattern
+    if not scenario_pattern:
+        scenario_pattern = re.findall(
+            r"^\s+(\S+)\s+(.+?)\s+(passed|failed)", stdout, re.MULTILINE
+        )
+
+    # Extract duration metrics
+    dur_match = re.search(r"http_req_duration\s+min:\s+(\d+\.\d+)\s+ms", stdout)
+    if dur_match:
+        result["metrics"]["http_req_duration"]["min"] = float(dur_match.group(1))
+
+    dur_max = re.search(r"max:\s+(\d+\.\d+)\s+ms", stdout)
+    if dur_max:
+        result["metrics"]["http_req_duration"]["max"] = float(dur_max.group(1))
+
+    dur_mean = re.search(r"mean:\s+(\d+\.\d+)\s+ms", stdout)
+    if dur_mean:
+        result["metrics"]["http_req_duration"]["mean"] = float(dur_mean.group(1))
+
+    # p95
+    p95 = re.search(r"p\(95\):\s+(\d+\.\d+)\s+ms", stdout)
+    if p95:
+        result["metrics"]["http_req_duration"]["p95"] = float(p95.group(1))
+
+    # p99
+    p99 = re.search(r"p\(99\):\s+(\d+\.\d+)\s+ms", stdout)
+    if p99:
+        result["metrics"]["http_req_duration"]["p99"] = float(p99.group(1))
+
+    # Request count
+    reqs = re.search(r"http_reqs\s+(\d+)", stdout)
+    if reqs:
+        result["metrics"]["http_reqs"]["count"] = int(reqs.group(1))
+
+    # Iteration count
+    iters = re.search(r"iterations\s+(\d+)", stdout)
+    if iters:
+        result["metrics"]["iterations"] = int(iters.group(1))
+
+    # Check for failed status
+    if "failed" in stdout.lower() and "threshold" not in stdout.lower():
+        result["status"] = "failed"
+    elif "passing" in stdout.lower() or "✓" in stdout:
+        result["status"] = "passed"
+
+    return result
+
+
+# ── Execution Helpers ────────────────────────────────────────────────────────
+
+
+def check_k6_available() -> dict:
+    """Check whether k6 is installed and available.
+
+    Returns:
+        dict with: available, version, error.
+    """
+    try:
+        proc = subprocess.run(
+            ["k6", "version"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if proc.returncode == 0:
+            version = proc.stdout.strip() or proc.stderr.strip()
+            return {"available": True, "version": version, "error": None}
+        return {
+            "available": False,
+            "version": None,
+            "error": proc.stderr.strip() or "k6 returned non-zero exit code",
+        }
+    except FileNotFoundError:
+        return {
+            "available": False,
+            "version": None,
+            "error": "k6 not found in PATH",
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "available": False,
+            "version": None,
+            "error": "k6 version check timed out",
+        }
+
+
+def run_k6(script_path: str, cwd: str | None = None, timeout: int = 300) -> dict:
+    """Run a k6 script and capture results.
+
+    Args:
+        script_path: path to the k6 script.
+        cwd: working directory (defaults to script directory).
+        timeout: max seconds to wait.
+
+    Returns:
+        dict with: status, exit_code, stdout, stderr, duration, metrics.
+    """
+    script = Path(script_path)
+    working_dir = cwd or str(script.parent)
+
+    start = datetime.now(timezone.utc)
+    try:
+        proc = subprocess.run(
+            ["k6", "run", str(script)],
+            cwd=working_dir,
+            capture_output=True, text=True, timeout=timeout,
+            env={**os.environ, "TARGET_BASE_URL": ""},
+        )
+        duration = (datetime.now(timezone.utc) - start).total_seconds()
+        stdout = proc.stdout[:50000]
+        stderr = proc.stderr[:50000]
+        status = "passed" if proc.returncode == 0 else "failed"
+        return {
+            "status": status,
+            "exit_code": proc.returncode,
+            "stdout": stdout,
+            "stderr": stderr,
+            "duration": round(duration, 2),
+            "metrics": parse_k6_output(stdout),
+        }
+    except subprocess.TimeoutExpired:
+        duration = (datetime.now(timezone.utc) - start).total_seconds()
+        return {
+            "status": "timeout",
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"k6 timed out after {timeout}s",
+            "duration": round(duration, 2),
+            "metrics": {},
+        }
+    except FileNotFoundError:
+        return {
+            "status": "blocked",
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": "k6 not found — install k6 to run performance tests",
+            "duration": 0,
+            "metrics": {},
+        }

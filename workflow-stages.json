@@ -1,6 +1,6 @@
 {
-  "comment": "Machine-readable stage order extracted from orchestrator/workflow.md. The workflow.md remains the source of truth for stage definitions, handoffs, safety gates, and state machine logic. This file exists only because parsing Markdown for stage order is unreliable and impractical for a runtime.",
-  "version": "0.2.0",
+  "comment": "Machine-readable stage order extracted from orchestrator/workflow.md. The workflow.md remains the source of truth for stage definitions, handoffs, safety gates, and state machine logic. This file exists only because parsing Markdown for stage order is unreliable and impractical for a runtime. Performance testing is a sub-stage within execution (not a separate top-level stage) to keep the workflow at 14 stages. Performance status is tracked in stage-status.json under execution.performance_status.",
+  "version": "0.3.0",
   "stages": [
     "story-intake",
     "discovery",

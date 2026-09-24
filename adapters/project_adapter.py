@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -128,6 +129,41 @@ class ProjectAdapter:
 
         self._target_path = path
         return self._target_path
+
+    def get_test_command(self) -> str | None:
+        """Return an explicit test command from project config if configured.
+
+        The project.yaml can optionally define:
+            test:
+              command: npm run test:web
+
+        When present, this overrides automatic discovery.
+        """
+        target = self.project_config.get("test", {})
+        if isinstance(target, dict):
+            cmd = target.get("command")
+            if cmd and isinstance(cmd, str) and cmd.strip():
+                return cmd.strip()
+        return None
+
+    def is_playwright_project(self) -> bool:
+        """Check if the target project is a Playwright project."""
+        if not self._target_path:
+            return False
+        configs = list(self._target_path.glob("playwright.config.*"))
+        if not configs:
+            return False
+        pkg = self._target_path / "package.json"
+        if pkg.exists():
+            try:
+                with open(pkg) as f:
+                    data = json.load(f)
+                deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+                if "playwright" in deps or "@playwright/test" in deps:
+                    return True
+            except (OSError, json.JSONDecodeError):
+                pass
+        return bool(configs)
 
     # ── Capability Detection ─────────────────────────────────────────────────
 
@@ -681,17 +717,62 @@ class ProjectAdapter:
         cwd = working_directory or target or Path.cwd()
 
         start = time.time()
+        proc = None
+        stdout_data = ""
+        stderr_data = ""
         try:
-            proc = subprocess.run(
+            import tempfile as _tmp
+            stdout_file = _tmp.NamedTemporaryFile(delete=False, suffix=".stdout")
+            stderr_file = _tmp.NamedTemporaryFile(delete=False, suffix=".stderr")
+            stdout_path = Path(stdout_file.name)
+            stderr_path = Path(stderr_file.name)
+            stdout_file.close()
+            stderr_file.close()
+
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=str(cwd),
-                capture_output=True,
+                stdout=stdout_path.open("w"),
+                stderr=stderr_path.open("w"),
                 text=True,
-                timeout=timeout,
                 env={**os.environ, **(env or {})},
+                start_new_session=True,
             )
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                duration = time.time() - start
+                if proc is not None:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                stdout_data = stdout_path.read_text()[:50000] if stdout_path.exists() else ""
+                stderr_data = stderr_path.read_text()[:50000] if stderr_path.exists() else ""
+                stdout_path.unlink(missing_ok=True)
+                stderr_path.unlink(missing_ok=True)
+                return {
+                    "status": "timeout",
+                    "command": command,
+                    "classification": classification,
+                    "working_directory": str(cwd),
+                    "exit_code": -1,
+                    "duration": round(duration, 2),
+                    "stdout": stdout_data,
+                    "stderr": stderr_data + f"\nCommand timed out after {timeout} seconds. Process group killed.",
+                    "artifacts": [],
+                    "errors": ["timeout"],
+                }
             duration = time.time() - start
+            stdout_data = stdout_path.read_text()[:50000] if stdout_path.exists() else ""
+            stderr_data = stderr_path.read_text()[:50000] if stderr_path.exists() else ""
+            stdout_path.unlink(missing_ok=True)
+            stderr_path.unlink(missing_ok=True)
             return {
                 "status": "completed" if proc.returncode == 0 else "failed",
                 "command": command,
@@ -699,27 +780,20 @@ class ProjectAdapter:
                 "working_directory": str(cwd),
                 "exit_code": proc.returncode,
                 "duration": round(duration, 2),
-                "stdout": proc.stdout[:50000] if proc.stdout else "",
-                "stderr": proc.stderr[:50000] if proc.stderr else "",
+                "stdout": stdout_data,
+                "stderr": stderr_data,
                 "artifacts": [],
                 "errors": [],
             }
-        except subprocess.TimeoutExpired:
-            duration = time.time() - start
-            return {
-                "status": "timeout",
-                "command": command,
-                "classification": classification,
-                "working_directory": str(cwd),
-                "exit_code": -1,
-                "duration": round(duration, 2),
-                "stdout": "",
-                "stderr": f"Command timed out after {timeout} seconds.",
-                "artifacts": [],
-                "errors": ["timeout"],
-            }
         except OSError as e:
             duration = time.time() - start
+            stdout_data = stdout_path.read_text()[:50000] if stdout_path.exists() else ""
+            stderr_data = stderr_path.read_text()[:50000] if stderr_path.exists() else ""
+            try:
+                stdout_path.unlink(missing_ok=True)
+                stderr_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             return {
                 "status": "error",
                 "command": command,
@@ -727,7 +801,7 @@ class ProjectAdapter:
                 "working_directory": str(cwd),
                 "exit_code": -1,
                 "duration": round(duration, 2),
-                "stdout": "",
+                "stdout": stdout_data,
                 "stderr": str(e),
                 "artifacts": [],
                 "errors": [str(e)],

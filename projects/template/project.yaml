@@ -1,6 +1,6 @@
 project:
-  name: PROJECT_NAME
-  description: PROJECT_DESCRIPTION
+  name: PROJECT_NAME  # e.g. "my-app"
+  description: PROJECT_DESCRIPTION  # e.g. "Customer-facing web application"
 
 application:
   web: true
@@ -8,8 +8,12 @@ application:
   mobile: false
 
 automation:
-  framework: playwright
-  language: javascript
+  framework: playwright  # or cypress, pytest, etc.
+  language: javascript   # or python, java, etc.
+
+target_repository:
+  path: ../target-project  # relative path to your test automation repo
+  ci_workspace: false
 
 api:
   rest: true
@@ -27,11 +31,8 @@ security:
   enabled: false
 
 accessibility: false
-
 visual: false
-
 events: false
-
 webhooks: false
 
 ci:

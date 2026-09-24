@@ -11,12 +11,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Harness root directory (shared-state lives here)
+ROOT = Path(__file__).resolve().parent.parent
 from typing import Any
 
 
@@ -80,45 +84,127 @@ class PlaywrightAgent:
         """Check if Playwright execution environment is available."""
         if not self.target_path.is_dir():
             return False
-        # Check for Playwright config
-        configs = list(self.target_path.glob("playwright.config.*"))
+        # Check for Playwright config (search recursively — config may be in subdirectory)
+        configs = list(self.target_path.rglob("playwright.config.*"))
         if not configs:
-            return False
-        # Check for test files
-        test_files = list(self.target_path.rglob("*.spec.js")) + \
-                     list(self.target_path.rglob("*.spec.ts")) + \
-                     list(self.target_path.rglob("*.test.ts")) + \
-                     list(self.target_path.rglob("*.test.js"))
-        if not test_files:
-            return False
+            # Also check common config directories
+            for subdir in ["config", "tests", ".playwright"]:
+                subdir_path = self.target_path / subdir
+                if subdir_path.is_dir():
+                    configs.extend(subdir_path.glob("playwright.config.*"))
+            if not configs:
+                return False
         # Check for node_modules
         if not (self.target_path / "node_modules").is_dir():
             return False
+        # Check that Playwright is installed in node_modules
+        if not (self.target_path / "node_modules" / "@playwright" / "test").is_dir():
+            if not (self.target_path / "node_modules" / "playwright").is_dir():
+                return False
         return True
 
     def _find_test_command(self) -> str | None:
-        """Find the npm test command from package.json."""
+        """Find a Playwright test command from package.json and project config.
+
+        Discovery precedence:
+        1. Explicit test.command from project config (highest priority)
+        2. Discovered Playwright npm script
+        3. Direct Playwright CLI fallback
+        4. None (caller handles BLOCKED)
+        """
         pkg = self.target_path / "package.json"
         if not pkg.exists():
             return None
+
+        scripts = {}
         try:
             with open(pkg) as f:
                 data = json.load(f)
             scripts = data.get("scripts", {})
-            for name in ["test", "test:e2e", "test:ui"]:
-                if name in scripts:
-                    return f"npm run {name}"
-            return None
         except (OSError, json.JSONDecodeError):
             return None
 
+        # 1. Check for explicit override in project config via adapter
+        if self.adapter:
+            try:
+                tc = self.adapter.get_test_command()
+                if tc:
+                    return tc
+            except Exception:
+                pass
+
+        # 2. Discover Playwright-invoking npm scripts
+        playwright_script = self._discover_playwright_script(scripts)
+        if playwright_script:
+            return f"npm run {playwright_script}"
+
+        # 3. Direct Playwright CLI fallback
+        if self._has_playwright_installation():
+            config = self._find_playwright_config()
+            if config:
+                return f"npx playwright test --config={config}"
+            return "npx playwright test"
+
+        return None
+
+    def _discover_playwright_script(self, scripts: dict) -> str | None:
+        """Find a package.json script that invokes Playwright.
+
+        Scans all scripts for commands containing 'playwright test'
+        or 'npx playwright test'. Excludes scripts that run mobile,
+        performance, or other non-UI test tooling.
+        """
+        skip_keywords = ["mobile", "performance", "appium", "docker", "security"]
+        candidates = []
+
+        for name, cmd in scripts.items():
+            if not isinstance(cmd, str):
+                continue
+            cmd_lower = cmd.lower()
+            # Must invoke Playwright
+            if "playwright test" not in cmd_lower and "npx playwright test" not in cmd_lower:
+                continue
+            # Exclude non-UI scripts
+            if any(kw in cmd_lower for kw in skip_keywords):
+                continue
+            # Prefer shorter, more generic names
+            candidates.append((len(name), name, cmd))
+
+        if not candidates:
+            return None
+
+        # Sort by name length (shorter = more generic), then pick first
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
+
+    def _has_playwright_installation(self) -> bool:
+        """Check whether Playwright is installed in the target project."""
+        pkg = self.target_path / "package.json"
+        if not pkg.exists():
+            return False
+        try:
+            with open(pkg) as f:
+                data = json.load(f)
+            deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
+            return "playwright" in deps or "@playwright/test" in deps
+        except (OSError, json.JSONDecodeError):
+            return False
+
+    def _find_playwright_config(self) -> str | None:
+        """Find a Playwright config file in the target project."""
+        configs = list(self.target_path.glob("playwright.config.*"))
+        if configs:
+            return str(configs[0].relative_to(self.target_path))
+        return None
+
     def _find_test_files(self) -> list[str]:
-        """Find Playwright test files in the target project."""
+        """Find Playwright test files in the target project (excluding node_modules)."""
         patterns = ["*.spec.js", "*.spec.ts", "*.test.ts", "*.test.js"]
         files = []
         for pattern in patterns:
-            files.extend(str(f.relative_to(self.target_path))
-                        for f in self.target_path.rglob(pattern))
+            for f in self.target_path.rglob(pattern):
+                if "node_modules" not in f.parts:
+                    files.append(str(f.relative_to(self.target_path)))
         return sorted(set(files))
 
     def execute_scenario(self, scenario: dict) -> ExecutionResult:
@@ -178,7 +264,12 @@ class PlaywrightAgent:
 
         # Execute
         if self.adapter:
-            raw = self.adapter.execute_command(cmd, working_directory=self.target_path, timeout=300)
+            raw = self.adapter.execute_command(
+                cmd,
+                working_directory=self.target_path,
+                timeout=300,
+                env={"APP_URL": ""},
+            )
             return ExecutionResult(
                 status=raw.get("status", "unknown"),
                 command=cmd,
@@ -196,10 +287,55 @@ class PlaywrightAgent:
 
         # Fallback: direct subprocess execution
         start = time.time()
+        import tempfile as _tmp
+        stdout_file = _tmp.NamedTemporaryFile(delete=False, suffix=".stdout")
+        stderr_file = _tmp.NamedTemporaryFile(delete=False, suffix=".stderr")
+        stdout_path = Path(stdout_file.name)
+        stderr_path = Path(stderr_file.name)
+        stdout_file.close()
+        stderr_file.close()
+        proc = None
         try:
-            proc = subprocess.run(cmd, shell=True, cwd=str(self.target_path),
-                                   capture_output=True, text=True, timeout=300)
+            proc = subprocess.Popen(
+                cmd,
+                shell=True,
+                cwd=str(self.target_path),
+                stdout=stdout_path.open("w"),
+                stderr=stderr_path.open("w"),
+                text=True,
+                env={**__import__('os').environ, "APP_URL": ""},
+                start_new_session=True,
+            )
+            try:
+                proc.wait(timeout=300)
+            except subprocess.TimeoutExpired:
+                if proc is not None:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+                stdout_data = stdout_path.read_text()[:50000] if stdout_path.exists() else ""
+                stderr_data = stderr_path.read_text()[:50000] if stderr_path.exists() else ""
+                stdout_path.unlink(missing_ok=True)
+                stderr_path.unlink(missing_ok=True)
+                return ExecutionResult(
+                    status="timeout",
+                    command=cmd,
+                    scenario_id=scenario.get("id", ""),
+                    scenario_name=scenario.get("name", ""),
+                    exit_code=-1,
+                    duration=300,
+                    stdout=stdout_data,
+                    stderr=stderr_data + "\nCommand timed out after 300 seconds. Process group killed.",
+                    classification="UNKNOWN",
+                    working_directory=str(self.target_path),
+                    errors=["timeout"],
+                )
             duration = time.time() - start
+            stdout_data = stdout_path.read_text()[:50000] if stdout_path.exists() else ""
+            stderr_data = stderr_path.read_text()[:50000] if stderr_path.exists() else ""
+            stdout_path.unlink(missing_ok=True)
+            stderr_path.unlink(missing_ok=True)
             return ExecutionResult(
                 status="completed" if proc.returncode == 0 else "failed",
                 command=cmd,
@@ -207,30 +343,40 @@ class PlaywrightAgent:
                 scenario_name=scenario.get("name", ""),
                 exit_code=proc.returncode,
                 duration=round(duration, 2),
-                stdout=proc.stdout[:50000],
-                stderr=proc.stderr[:50000],
+                stdout=stdout_data,
+                stderr=stderr_data,
                 classification="SAFE",
                 working_directory=str(self.target_path),
             )
-        except subprocess.TimeoutExpired:
+        except OSError as e:
+            stdout_data = stdout_path.read_text()[:50000] if stdout_path.exists() else ""
+            stderr_data = stderr_path.read_text()[:50000] if stderr_path.exists() else ""
+            try:
+                stdout_path.unlink(missing_ok=True)
+                stderr_path.unlink(missing_ok=True)
+            except Exception:
+                pass
             return ExecutionResult(
-                status="timeout",
+                status="error",
                 command=cmd,
                 scenario_id=scenario.get("id", ""),
                 scenario_name=scenario.get("name", ""),
                 exit_code=-1,
-                duration=300,
-                stderr="Command timed out after 300 seconds.",
+                duration=round(time.time() - start, 2),
+                stdout=stdout_data,
+                stderr=str(e),
                 classification="UNKNOWN",
                 working_directory=str(self.target_path),
-                errors=["timeout"],
+                errors=[str(e)],
             )
 
     def execute_all(self, scenarios: list[dict]) -> list[ExecutionResult]:
         """Execute all assigned scenarios.
 
-        For Playwright, we run the full test suite once and parse the report.
-        Individual scenario results are mapped from the test report.
+        For Playwright, we run the story's generated spec file directly
+        (not the full suite) so the execution matches what was designed
+        for this story. The spec file is in shared-state/<story>/execution/spec/.
+        We copy it into the target repo, run it, then clean up.
         """
         if not self.can_execute():
             return [ExecutionResult(
@@ -247,9 +393,15 @@ class PlaywrightAgent:
                             "details": f"target_path={self.target_path}"},
             )]
 
-        # Run the full test suite
-        cmd = self._find_test_command()
-        if cmd is None:
+        # Find the story's generated spec file in shared-state
+        story_spec = None
+        # Search from the harness root (_ROOT) since shared-state is there
+        for cfg in ROOT.glob("shared-state/*/execution/spec/*.spec.js"):
+            if cfg.name.startswith(self.story_id):
+                story_spec = cfg
+                break
+
+        if story_spec is None:
             return [ExecutionResult(
                 status="blocked",
                 command="",
@@ -257,43 +409,66 @@ class PlaywrightAgent:
                 scenario_name="",
                 exit_code=-1,
                 duration=0,
-                stderr="No test command in package.json.",
+                stderr="No story spec file found in shared-state.",
                 classification="UNKNOWN",
                 working_directory=str(self.target_path),
             )]
 
-        print(f"[{self.name}] Running: {cmd}")
-        if self.adapter:
-            raw = self.adapter.execute_command(cmd, working_directory=self.target_path, timeout=300)
-        else:
+        # Copy spec into target repo root so Playwright can resolve it with the config
+        target_spec = self.target_path / story_spec.name
+        try:
+            target_spec.write_bytes(story_spec.read_bytes())
+        except OSError as e:
+            return [ExecutionResult(
+                status="blocked",
+                command="",
+                scenario_id="",
+                scenario_name="",
+                exit_code=-1,
+                duration=0,
+                stderr=f"Cannot copy spec into target repo: {e}",
+                classification="UNKNOWN",
+                working_directory=str(self.target_path),
+            )]
+
+        try:
+            # Run only this story's spec, not the full suite
+            config_file = self._find_playwright_config() or "playwright.config.js"
+            cmd = f"npx playwright test {story_spec.name} --config={config_file} --timeout=60000 --reporter=line"
+            print(f"[{self.name}] Running story spec: {cmd}")
             start = time.time()
+            proc = subprocess.run(cmd, shell=True, cwd=str(self.target_path),
+                                  capture_output=True, text=True, timeout=90)
+            duration = time.time() - start
+            raw = {
+                "status": "completed" if proc.returncode == 0 else "failed",
+                "command": cmd,
+                "exit_code": proc.returncode,
+                "duration": round(duration, 2),
+                "stdout": proc.stdout[:50000],
+                "stderr": proc.stderr[:50000],
+                "artifacts": [],
+                "errors": [],
+                "classification": "SAFE",
+            }
+        except subprocess.TimeoutExpired:
+            raw = {
+                "status": "timeout",
+                "command": cmd,
+                "exit_code": -1,
+                "duration": 90,
+                "stdout": "",
+                "stderr": "Story spec timed out after 90 seconds.",
+                "artifacts": [],
+                "errors": ["timeout"],
+                "classification": "UNKNOWN",
+            }
+        finally:
+            # Clean up: remove the copied spec file
             try:
-                proc = subprocess.run(cmd, shell=True, cwd=str(self.target_path),
-                                       capture_output=True, text=True, timeout=300)
-                duration = time.time() - start
-                raw = {
-                    "status": "completed" if proc.returncode == 0 else "failed",
-                    "command": cmd,
-                    "exit_code": proc.returncode,
-                    "duration": round(duration, 2),
-                    "stdout": proc.stdout[:50000],
-                    "stderr": proc.stderr[:50000],
-                    "artifacts": [],
-                    "errors": [],
-                    "classification": "SAFE",
-                }
-            except subprocess.TimeoutExpired:
-                raw = {
-                    "status": "timeout",
-                    "command": cmd,
-                    "exit_code": -1,
-                    "duration": 300,
-                    "stdout": "",
-                    "stderr": "Command timed out after 300 seconds.",
-                    "artifacts": [],
-                    "errors": ["timeout"],
-                    "classification": "UNKNOWN",
-                }
+                target_spec.unlink()
+            except OSError:
+                pass
 
         # Parse test results from stdout if available
         test_results = self._parse_playwright_output(raw.get("stdout", ""))
